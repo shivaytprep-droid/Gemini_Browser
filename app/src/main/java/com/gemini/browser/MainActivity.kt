@@ -60,9 +60,9 @@ class MainActivity : Activity() {
     @Volatile private var currentTitle = ""
     @Volatile private var queuedFilePath: String? = null
 
-    // Pure Chrome Browser User-Agents (Without 'wv' or WebView signature to allow Google OAuth login)
-    private val mobileUA = "Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.6478.122 Mobile Safari/537.36"
-    private val desktopUA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.6478.122 Safari/537.36"
+    // Official Chrome Reduced User-Agent (Bypasses Google OAuth WebView Disallowed Error)
+    private val mobileUA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
+    private val desktopUA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
     companion object {
         private val serverStarted = AtomicBoolean(false)
@@ -169,7 +169,7 @@ class MainActivity : Activity() {
         }
 
         consoleText = TextView(this).apply {
-            text = "🟡 Starting Gemini Browser 127.0.0.1:8080..."
+            text = "🟡 Starting 127.0.0.1:8080..."
             setTextColor(Color.parseColor("#FFD600"))
             textSize = 10.5f
             typeface = Typeface.MONOSPACE
@@ -318,7 +318,7 @@ class MainActivity : Activity() {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 dp(110)
             )
-            text = "[System] Gemini Browser Ready...\n"
+            text = "[System] Gemini Browser Log Ready...\n"
         }
 
         root.addView(navBar)
@@ -328,6 +328,8 @@ class MainActivity : Activity() {
 
         setContentView(root)
     }
+
+    // ==================== USERSCRIPT MANAGER (UI + ENGINE) ====================
 
     private fun getSavedUserScripts(): JSONArray {
         val raw = prefs.getString("userscripts_list", "[]") ?: "[]"
@@ -462,7 +464,7 @@ class MainActivity : Activity() {
         val editingObj = if (editIndex in 0 until scripts.length()) scripts.getJSONObject(editIndex) else null
 
         val nameInput = EditText(this).apply {
-            hint = "Script Name"
+            hint = "Script Name (e.g. Auto Fill / Custom UI)"
             setHintTextColor(Color.GRAY)
             setTextColor(Color.WHITE)
             setBackgroundColor(Color.parseColor("#2A2A2A"))
@@ -477,7 +479,7 @@ class MainActivity : Activity() {
         }
 
         val codeInput = EditText(this).apply {
-            hint = "// JavaScript code here..."
+            hint = "// Paste JavaScript or Tampermonkey UserScript here...\n// Optional: // @match https://example.com/*\nconsole.log('UserScript Active!');"
             setHintTextColor(Color.GRAY)
             setTextColor(Color.parseColor("#80CBC4"))
             setBackgroundColor(Color.parseColor("#0D0D0D"))
@@ -525,7 +527,7 @@ class MainActivity : Activity() {
         }
 
         val btnClearCode = Button(this).apply {
-            text = "🗑️ Clear"
+            text = "🗑️ Clear Box"
             textSize = 10f
             setTextColor(Color.WHITE)
             setBackgroundColor(Color.parseColor("#455A64"))
@@ -556,14 +558,14 @@ class MainActivity : Activity() {
                 val jsCode = codeInput.text.toString()
                 if (jsCode.trim().isNotEmpty()) {
                     runSingleUserScriptOnPage(nameInput.text.toString().ifEmpty { "TempScript" }, jsCode)
-                    Toast.makeText(this@MainActivity, "Script Executed!", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this@MainActivity, "Script Executed on Page!", Toast.LENGTH_SHORT).show()
                     dialogRef?.dismiss()
                 }
             }
         }
 
         val btnSaveAuto = Button(this).apply {
-            text = if (editIndex >= 0) "💾 Update" else "💾 Save & Run"
+            text = if (editIndex >= 0) "💾 Update Script" else "💾 Save & Auto-Run"
             textSize = 11f
             setTextColor(Color.WHITE)
             setBackgroundColor(Color.parseColor("#2E7D32"))
@@ -591,7 +593,7 @@ class MainActivity : Activity() {
                 }
                 saveUserScripts(scripts)
                 runSingleUserScriptOnPage(sName, jsCode)
-                Toast.makeText(this@MainActivity, "Saved: $sName", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this@MainActivity, "Saved & Executed: $sName", Toast.LENGTH_SHORT).show()
                 dialogRef?.dismiss()
             }
         }
@@ -630,15 +632,35 @@ class MainActivity : Activity() {
         val js = """
             (function() {
                 try {
+                    if (typeof window.GM_addStyle === 'undefined') {
+                        window.GM_addStyle = function(css) {
+                            const s = document.createElement('style');
+                            s.textContent = css;
+                            (document.head || document.documentElement).appendChild(s);
+                            return s;
+                        };
+                    }
+                    if (typeof window.GM_setValue === 'undefined') {
+                        window.GM_setValue = function(k, v) { localStorage.setItem('GM_' + k, JSON.stringify(v)); };
+                    }
+                    if (typeof window.GM_getValue === 'undefined') {
+                        window.GM_getValue = function(k, defVal) {
+                            const v = localStorage.getItem('GM_' + k);
+                            return v !== null ? JSON.parse(v) : defVal;
+                        };
+                    }
+                    if (typeof window.GM_deleteValue === 'undefined') {
+                        window.GM_deleteValue = function(k) { localStorage.removeItem('GM_' + k); };
+                    }
                     const bin = atob('$b64');
                     const bytes = new Uint8Array(bin.length);
                     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
                     const decodedCode = new TextDecoder('utf-8').decode(bytes);
                     const fn = new Function(decodedCode);
                     fn();
-                    console.log('[GeminiBrowser UserScript] $safeName executed');
+                    console.log('[AI UserScript Executed] $safeName');
                 } catch (e) {
-                    console.error('[GeminiBrowser UserScript Error] $safeName:', e);
+                    console.error('[AI UserScript Error] $safeName:', e);
                 }
             })();
         """.trimIndent()
@@ -661,6 +683,8 @@ class MainActivity : Activity() {
             }
         }
     }
+
+    // ==================== VIEWPORT & WEBVIEW CONFIG ====================
 
     private fun updateWebViewViewportBounds() {
         val cw = webContainer.width
@@ -711,7 +735,7 @@ class MainActivity : Activity() {
             updateWebViewViewportBounds()
             webView.reload()
         }
-        appendLog("Desktop Mode -> $desktopMode")
+        appendLog("Desktop Mode (1280px) -> $desktopMode")
     }
 
     private fun makeSmallButton(label: String, onClick: () -> Unit): Button {
@@ -747,6 +771,8 @@ class MainActivity : Activity() {
         s.javaScriptEnabled = true
         s.domStorageEnabled = true
         s.databaseEnabled = true
+        s.javaScriptCanOpenWindowsAutomatically = true
+        s.setSupportMultipleWindows(false)
         s.allowFileAccess = true
         s.allowContentAccess = true
         s.loadWithOverviewMode = true
@@ -757,10 +783,8 @@ class MainActivity : Activity() {
         s.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
         s.userAgentString = mobileUA
 
-        // Enable cookies completely for Google Accounts session
-        val cookieManager = CookieManager.getInstance()
-        cookieManager.setAcceptCookie(true)
-        cookieManager.setAcceptThirdPartyCookies(webView, true)
+        CookieManager.getInstance().setAcceptCookie(true)
+        CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
 
         webView.addJavascriptInterface(object {
             @JavascriptInterface
@@ -768,13 +792,15 @@ class MainActivity : Activity() {
                 isNetworkIdle = true
                 broadcastSse("network_idle", url)
                 if (serverStarted.get()) {
-                    setConsoleStatus("🟢 ONLINE 127.0.0.1:8080 | Ready", false)
+                    setConsoleStatus("🟢 ONLINE 127.0.0.1:8080 | AI: Idle", false)
                 }
             }
 
             @JavascriptInterface
-            fun logAllowClicked(msg: String) {
-                appendLog("⚡ Auto-Allowed: $msg")
+            fun onAutoAllowed(toolInfo: String) {
+                appendLog("⚡ Auto-Clicked Latest Allow: $toolInfo")
+                setConsoleStatus("🟢 Auto-Allowed MCP Tool!", false)
+                broadcastSse("auto_allow_clicked", toolInfo)
             }
         }, "AIAgentBridge")
 
@@ -789,7 +815,7 @@ class MainActivity : Activity() {
                 isNetworkIdle = false
                 currentUrl = url ?: ""
                 urlInput.setText(currentUrl)
-                injectStealthAndAutoAllowWatcher()
+                injectStealthViewportAndTracker()
                 if (serverStarted.get()) {
                     setConsoleStatus("🟢 127.0.0.1:8080 | Loading...", false)
                 }
@@ -802,28 +828,30 @@ class MainActivity : Activity() {
                 currentTitle = view?.title ?: ""
                 urlInput.setText(currentUrl)
                 CookieManager.getInstance().flush()
-                injectStealthAndAutoAllowWatcher()
+                injectStealthViewportAndTracker()
                 injectSavedUserScripts(currentUrl)
                 broadcastSse("page_loaded", currentUrl)
                 if (serverStarted.get()) {
-                    setConsoleStatus("🟢 ONLINE 127.0.0.1:8080 | Ready", false)
+                    setConsoleStatus("🟢 ONLINE 127.0.0.1:8080 | AI: Ready", false)
                 }
             }
         }
 
         webView.webChromeClient = object : WebChromeClient() {
             override fun onJsAlert(view: WebView?, url: String?, message: String?, result: JsResult?): Boolean {
-                appendLog("Alert: $message")
+                appendLog("Auto-Accepted Alert: $message")
                 result?.confirm()
                 return true
             }
 
             override fun onJsConfirm(view: WebView?, url: String?, message: String?, result: JsResult?): Boolean {
+                appendLog("Auto-Confirmed Dialog: $message")
                 result?.confirm()
                 return true
             }
 
             override fun onJsPrompt(view: WebView?, url: String?, message: String?, defaultValue: String?, result: JsPromptResult?): Boolean {
+                appendLog("Auto-Prompt Dialog: $message")
                 result?.confirm(defaultValue ?: "")
                 return true
             }
@@ -837,7 +865,7 @@ class MainActivity : Activity() {
                 if (!path.isNullOrEmpty()) {
                     val f = File(path)
                     if (f.exists()) {
-                        appendLog("Auto-Uploaded: ${f.name}")
+                        appendLog("Auto-Uploaded File: ${f.name}")
                         filePathCallback?.onReceiveValue(arrayOf(Uri.fromFile(f)))
                         queuedFilePath = null
                         return true
@@ -849,63 +877,134 @@ class MainActivity : Activity() {
         }
     }
 
-    // Google Login Bypass Stealth + Auto Click "Allow" Watcher
-    private fun injectStealthAndAutoAllowWatcher() {
+    // Google OAuth Stealth + Latest "Allow" Auto-Clicker + In-DOM <select> Modal
+    private fun injectStealthViewportAndTracker() {
         val isPc = if (desktopMode) "true" else "false"
         val js = """
             (function() {
                 try {
-                    // 1. Google OAuth & Anti-Bot Detection Bypass
-                    Object.defineProperty(navigator, 'webdriver', { get: () => false });
-                    if (!window.chrome) {
-                        window.chrome = {
-                            runtime: {},
-                            loadTimes: function() {},
-                            csi: function() {},
-                            app: {}
-                        };
-                    }
+                    // 1. Stealth Spoofing for Google Login Acceptance
+                    Object.defineProperty(navigator, 'webdriver', { get: () => false, configurable: true });
+                    window.chrome = window.chrome || { runtime: {}, app: {}, csi: function(){}, loadTimes: function(){} };
+                    Object.defineProperty(navigator, 'vendor', { get: () => 'Google Inc.', configurable: true });
+
+                    const brandsList = [
+                        { brand: 'Not/A)Brand', version: '8' },
+                        { brand: 'Chromium', version: '126' },
+                        { brand: 'Google Chrome', version: '126' }
+                    ];
                     if ($isPc) {
                         Object.defineProperty(navigator, 'platform', { get: () => 'Linux x86_64', configurable: true });
                         Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0, configurable: true });
+                        Object.defineProperty(navigator, 'userAgentData', {
+                            get: () => ({
+                                brands: brandsList,
+                                mobile: false,
+                                platform: 'Linux',
+                                getHighEntropyValues: async () => ({
+                                    architecture: 'x86',
+                                    bitness: '64',
+                                    brands: brandsList,
+                                    mobile: false,
+                                    model: '',
+                                    platform: 'Linux',
+                                    platformVersion: '6.5.0',
+                                    uaFullVersion: '126.0.6478.122'
+                                })
+                            }),
+                            configurable: true
+                        });
+                    } else {
+                        Object.defineProperty(navigator, 'userAgentData', {
+                            get: () => ({
+                                brands: brandsList,
+                                mobile: true,
+                                platform: 'Android',
+                                getHighEntropyValues: async () => ({
+                                    architecture: 'arm',
+                                    bitness: '64',
+                                    brands: brandsList,
+                                    mobile: true,
+                                    model: 'Pixel 8',
+                                    platform: 'Android',
+                                    platformVersion: '14.0.0',
+                                    uaFullVersion: '126.0.6478.122'
+                                })
+                            }),
+                            configurable: true
+                        });
                     }
                 } catch (e) {}
 
-                // 2. Auto Click "Allow" Watcher for Gemini MCP Tool Confirmations
-                if (!window.__aiAllowWatcherRunning) {
-                    window.__aiAllowWatcherRunning = true;
+                // 2. Auto-Click Newly Appeared Latest "Allow" Button (Gemini MCP Tool Confirmation)
+                if (!window.__geminiAllowClickerInstalled) {
+                    window.__geminiAllowClickerInstalled = true;
 
-                    function triggerAutoAllow() {
+                    function findAndClickLatestAllow() {
                         try {
-                            const buttons = Array.from(document.querySelectorAll('button, div[role="button"], span[role="button"]'));
-                            for (let b of buttons) {
-                                const text = (b.innerText || b.textContent || '').trim();
-                                if (text.toLowerCase() === 'allow') {
-                                    const rect = b.getBoundingClientRect();
-                                    if (rect.width > 0 && rect.height > 0 && !b.disabled) {
-                                        b.click();
-                                        if (window.AIAgentBridge && window.AIAgentBridge.logAllowClicked) {
-                                            window.AIAgentBridge.logAllowClicked('Tool Call Allow Button Clicked');
+                            const candidates = [];
+                            function collectButtons(root) {
+                                if (!root) return;
+                                const els = root.querySelectorAll('button, [role="button"]');
+                                for (let i = 0; i < els.length; i++) {
+                                    const el = els[i];
+                                    const txt = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+                                    const aria = (el.getAttribute('aria-label') || '').trim();
+                                    if (txt.toLowerCase() === 'allow' || aria.toLowerCase() === 'allow') {
+                                        const r = el.getBoundingClientRect();
+                                        const s = window.getComputedStyle(el);
+                                        if (r.width > 10 && r.height > 10 &&
+                                            s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0' &&
+                                            !el.disabled && el.getAttribute('aria-disabled') !== 'true') {
+                                            candidates.push(el);
                                         }
-                                        break;
+                                    }
+                                }
+                                const allNodes = root.querySelectorAll('*');
+                                for (let i = 0; i < allNodes.length; i++) {
+                                    if (allNodes[i].shadowRoot) {
+                                        collectButtons(allNodes[i].shadowRoot);
                                     }
                                 }
                             }
-                        } catch (e) {}
+
+                            collectButtons(document);
+
+                            if (candidates.length > 0) {
+                                // Pick the LAST (latest added) visible Allow button in DOM
+                                const latestBtn = candidates[candidates.length - 1];
+                                const now = Date.now();
+                                const lastClickedTime = parseInt(latestBtn.getAttribute('data-ai-allow-ts') || '0', 10);
+
+                                // Click immediately if never clicked, or retry if still open after 1200ms
+                                if (now - lastClickedTime > 1200) {
+                                    latestBtn.setAttribute('data-ai-allow-ts', String(now));
+                                    const evOpts = { bubbles: true, cancelable: true, composed: true, view: window };
+                                    latestBtn.dispatchEvent(new PointerEvent('pointerdown', evOpts));
+                                    latestBtn.dispatchEvent(new MouseEvent('mousedown', evOpts));
+                                    latestBtn.dispatchEvent(new PointerEvent('pointerup', evOpts));
+                                    latestBtn.dispatchEvent(new MouseEvent('mouseup', evOpts));
+                                    latestBtn.click();
+
+                                    if (window.AIAgentBridge && window.AIAgentBridge.onAutoAllowed) {
+                                        window.AIAgentBridge.onAutoAllowed('Allow button #' + candidates.length);
+                                    }
+                                }
+                            }
+                        } catch (err) {}
                     }
 
-                    // Continuous observer to immediately catch popup rendering
-                    const allowObserver = new MutationObserver((mutations) => {
-                        triggerAutoAllow();
+                    const allowObs = new MutationObserver(function() {
+                        findAndClickLatestAllow();
                     });
-
-                    if (document.body) {
-                        allowObserver.observe(document.body, { childList: true, subtree: true });
+                    if (document.documentElement) {
+                        allowObs.observe(document.documentElement, { childList: true, subtree: true });
                     }
-                    setInterval(triggerAutoAllow, 400);
+                    setInterval(findAndClickLatestAllow, 350);
+                    findAndClickLatestAllow();
                 }
 
-                // Smart In-DOM <select> Modal Builder
+                // 3. Smart In-DOM <select> Modal Builder
                 window.__aiOpenSelectModal = function(selectEl) {
                     if (!selectEl || selectEl.tagName !== 'SELECT') return false;
                     const existing = document.getElementById('__ai_select_modal');
@@ -944,6 +1043,9 @@ class MainActivity : Activity() {
                             selectEl.dispatchEvent(new Event('focus', { bubbles: true }));
                             selectEl.dispatchEvent(new Event('input', { bubbles: true }));
                             selectEl.dispatchEvent(new Event('change', { bubbles: true }));
+                            if (window.jQuery) {
+                                try { window.jQuery(selectEl).trigger('change'); } catch (e) {}
+                            }
                             modal.remove();
                         });
                         card.appendChild(item);
@@ -997,17 +1099,19 @@ class MainActivity : Activity() {
                 }
 
                 const origSend = XMLHttpRequest.prototype.send;
-                if (origSend) {
-                    XMLHttpRequest.prototype.send = function() {
-                        window.__aiPendingReq++;
-                        this.addEventListener('loadend', function() {
-                            window.__aiPendingReq = Math.max(0, window.__aiPendingReq - 1);
-                            checkIdle();
-                        });
-                        return origSend.apply(this, arguments);
-                    };
-                }
+                XMLHttpRequest.prototype.send = function() {
+                    window.__aiPendingReq++;
+                    this.addEventListener('loadend', function() {
+                        window.__aiPendingReq = Math.max(0, window.__aiPendingReq - 1);
+                        checkIdle();
+                    });
+                    return origSend.apply(this, arguments);
+                };
 
+                if (document.body) {
+                    new MutationObserver(function() { checkIdle(); })
+                        .observe(document.body, { childList: true, subtree: true });
+                }
                 checkIdle();
             })();
         """.trimIndent()
@@ -1016,7 +1120,7 @@ class MainActivity : Activity() {
 
     private fun ensureServerRunning() {
         if (serverStarted.get() && serverSocket != null && !serverSocket!!.isClosed) {
-            setConsoleStatus("🟢 ONLINE 127.0.0.1:8080 | Ready", false)
+            setConsoleStatus("🟢 ONLINE 127.0.0.1:8080 | AI: Ready", false)
             return
         }
 
@@ -1032,8 +1136,8 @@ class MainActivity : Activity() {
                 serverSocket = sock
                 serverStarted.set(true)
 
-                setConsoleStatus("🟢 ONLINE 127.0.0.1:8080 | Ready", false)
-                appendLog("Server listening on 0.0.0.0:8080")
+                setConsoleStatus("🟢 ONLINE 127.0.0.1:8080 | AI: Ready", false)
+                appendLog("Server listening on 0.0.0.0:8080 (Termux Ready)")
 
                 while (serverStarted.get() && !sock.isClosed) {
                     val client = sock.accept()
@@ -1044,7 +1148,7 @@ class MainActivity : Activity() {
                 }
             } catch (e: Exception) {
                 serverStarted.set(false)
-                setConsoleStatus("🔴 SERVER ERROR: ${e.message}", true)
+                setConsoleStatus("🔴 SERVER ERROR 8080: ${e.message}", true)
                 appendLog("Server error: ${e.message}")
             }
         }
@@ -1124,13 +1228,13 @@ class MainActivity : Activity() {
     private fun executeCommand(method: String, path: String, body: JSONObject?): String {
         isEmergencyStopped.set(false)
         appendLog("$method $path")
-        setConsoleStatus("🟢 CMD: $method $path", false)
+        setConsoleStatus("🟢 127.0.0.1:8080 | CMD: $method $path", false)
 
         return when (path) {
             "/", "/status" -> {
                 JSONObject()
                     .put("status", "online")
-                    .put("name", "Gemini Browser")
+                    .put("browser", "Gemini Browser")
                     .put("port", 8080)
                     .put("url", currentUrl)
                     .put("title", currentTitle)
@@ -1319,7 +1423,7 @@ class MainActivity : Activity() {
         val overlayW = overlayView.width.coerceAtLeast(1)
         val js = """
             (function() {
-                const selectors = 'a, button, input, select, textarea, [role="button"], [role="option"], [role="menuitem"], [role="textbox"], [contenteditable="true"], .monaco-editor, .cm-content';
+                const selectors = 'a, button, input, select, textarea, [role="button"], [role="option"], [role="menuitem"], [role="textbox"], [role="code"], [contenteditable="true"], .monaco-editor, .cm-content, .ace_editor, [onclick], summary';
                 const nodes = document.querySelectorAll(selectors);
                 const scale = $overlayW / (window.innerWidth || 1);
                 const list = [];
@@ -1336,12 +1440,33 @@ class MainActivity : Activity() {
                         const id = idCounter++;
                         el.setAttribute('data-ai-id', id);
                         const tag = el.tagName.toLowerCase();
+                        const isEditor = el.classList.contains('monaco-editor') || el.classList.contains('cm-content') || el.getAttribute('contenteditable') === 'true';
 
-                        let rawLabel = (el.innerText || el.value || el.placeholder || el.getAttribute('aria-label') || el.name || '').replace(/\s+/g, ' ').trim();
+                        let rawLabel = '';
+                        let optionsPreview = null;
+
+                        if (tag === 'select') {
+                            const selOpt = el.options && el.selectedIndex >= 0 ? el.options[el.selectedIndex] : null;
+                            rawLabel = selOpt ? (selOpt.text || selOpt.value || '') : '';
+                            const opts = [];
+                            if (el.options) {
+                                for (let i = 0; i < Math.min(el.options.length, 25); i++) {
+                                    opts.push((el.options[i].text || el.options[i].value || '').trim());
+                                }
+                            }
+                            optionsPreview = opts;
+                        } else {
+                            rawLabel = (el.innerText || el.value || el.placeholder || el.getAttribute('aria-label') || el.name || (isEditor ? 'Code Editor' : '')).replace(/\s+/g, ' ').trim();
+                            if (rawLabel.length <= 4 && el.parentElement) {
+                                const rowText = (el.parentElement.innerText || '').replace(/\s+/g, ' ').trim();
+                                if (rowText.length > rawLabel.length) rawLabel = rowText;
+                            }
+                        }
 
                         const itemObj = {
                             id: id,
-                            tag: tag,
+                            tag: isEditor ? 'code-editor' : (el.getAttribute('role') === 'option' ? 'dropdown-option' : tag),
+                            type: el.type || (tag === 'select' ? 'dropdown' : (isEditor ? 'monaco/codemirror' : '')),
                             text: rawLabel.slice(0, 140),
                             x: Math.round((r.left + r.width / 2) * scale),
                             y: Math.round((r.top + r.height / 2) * scale),
@@ -1352,6 +1477,7 @@ class MainActivity : Activity() {
                             width: Math.round(r.width * scale),
                             height: Math.round(r.height * scale)
                         };
+                        if (optionsPreview) itemObj.options = optionsPreview;
                         list.push(itemObj);
                     }
                 });
@@ -1392,8 +1518,27 @@ class MainActivity : Activity() {
             val textClickRes = evalJsSync("""
                 (function() {
                     const q = '$safeTarget'.trim().toLowerCase();
-                    const nodes = document.querySelectorAll('button, a, [role="button"], span, div');
-                    for (let i = 0; i < nodes.length; i++) {
+                    const selects = document.querySelectorAll('select');
+                    for (let s = 0; s < selects.length; s++) {
+                        const sel = selects[s];
+                        for (let i = 0; i < sel.options.length; i++) {
+                            const opt = sel.options[i];
+                            const txt = (opt.text || opt.label || opt.value || '').trim().toLowerCase();
+                            if (txt === q || txt.includes(q)) {
+                                sel.selectedIndex = i;
+                                sel.value = opt.value;
+                                sel.dispatchEvent(new Event('focus', { bubbles: true }));
+                                sel.dispatchEvent(new Event('input', { bubbles: true }));
+                                sel.dispatchEvent(new Event('change', { bubbles: true }));
+                                if (window.jQuery) { try { window.jQuery(sel).trigger('change'); } catch(e){} }
+                                const modal = document.getElementById('__ai_select_modal');
+                                if (modal) modal.remove();
+                                return JSON.stringify({ status: 'selected_option', option_text: opt.text, index: i, value: opt.value });
+                            }
+                        }
+                    }
+                    const nodes = document.querySelectorAll('[role="option"], [role="menuitem"], li, button, a, label, span, div');
+                    for (let i = nodes.length - 1; i >= 0; i--) {
                         const el = nodes[i];
                         const t = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
                         if (t === q) {
@@ -1405,7 +1550,9 @@ class MainActivity : Activity() {
                     return '';
                 })();
             """.trimIndent())
-            if (textClickRes.startsWith("{")) return textClickRes
+            if (textClickRes.startsWith("{")) {
+                return textClickRes
+            }
         }
 
         var screenX = rawX
@@ -1413,6 +1560,36 @@ class MainActivity : Activity() {
         var targetRect: RectF? = null
 
         if (elementId > 0) {
+            val specialCheck = evalJsSync("""
+                (function() {
+                    const el = document.querySelector('[data-ai-id="$elementId"]');
+                    if (!el) return '';
+                    if (el.getAttribute('role') === 'option' && el.hasAttribute('data-ai-select-index')) {
+                        const txt = (el.innerText || '').trim();
+                        el.click();
+                        return JSON.stringify({ status: 'selected_dropdown_option', element_id: $elementId, selected_text: txt });
+                    }
+                    if (el.tagName.toLowerCase() === 'select') {
+                        if (window.__aiOpenSelectModal) window.__aiOpenSelectModal(el);
+                        const opts = [];
+                        for (let i = 0; i < el.options.length; i++) {
+                            opts.push({ index: i, text: (el.options[i].text || '').trim(), value: el.options[i].value });
+                        }
+                        return JSON.stringify({
+                            status: 'select_dropdown_opened',
+                            element_id: $elementId,
+                            options: opts
+                        });
+                    }
+                    return '';
+                })();
+            """.trimIndent())
+
+            if (specialCheck.startsWith("{")) {
+                extractDomSync(true)
+                return specialCheck
+            }
+
             val js = """
                 (function() {
                     const el = document.querySelector('[data-ai-id="$elementId"]');
@@ -1431,7 +1608,7 @@ class MainActivity : Activity() {
                 })();
             """.trimIndent()
             val posStr = evalJsSync(js)
-            Thread.sleep(120)
+            Thread.sleep(200)
             if (posStr.isNotEmpty() && posStr != "null") {
                 val obj = JSONObject(posStr)
                 screenX = obj.getDouble("x").toFloat()
@@ -1450,7 +1627,7 @@ class MainActivity : Activity() {
         val wvTouchX = screenX * wvScaleRatio
         val wvTouchY = screenY * wvScaleRatio
 
-        val holdMs = (50..100).random().toLong()
+        val holdMs = (55..110).random().toLong()
         runOnMainSync {
             overlayView.showActionHighlight(screenX, screenY, targetRect, if (elementId > 0) "CLICK [$elementId]" else "TAP")
             val downTime = SystemClock.uptimeMillis()
@@ -1466,7 +1643,13 @@ class MainActivity : Activity() {
             evalJsSync("""
                 (function() {
                     const el = document.querySelector('[data-ai-id="$elementId"]');
-                    if (el) el.focus();
+                    if (!el) return;
+                    if (el.classList.contains('monaco-editor')) {
+                        const ta = el.querySelector('textarea.inputarea') || el.querySelector('textarea');
+                        if (ta) ta.focus(); else el.focus();
+                    } else {
+                        el.focus();
+                    }
                 })();
             """.trimIndent())
         }
@@ -1485,32 +1668,57 @@ class MainActivity : Activity() {
         val safeTxt = text.replace("\\", "\\\\").replace("'", "\\'")
         val res = evalJsSync("""
             (function() {
-                let el = $elementId > 0 ? document.querySelector('[data-ai-id="$elementId"]') : document.querySelector('select');
-                if (!el || el.tagName.toLowerCase() !== 'select') return JSON.stringify({ status: 'error', message: 'Select not found' });
-                
-                let chosenIdx = $index;
-                if (chosenIdx < 0) {
-                    for (let i = 0; i < el.options.length; i++) {
-                        const ot = (el.options[i].text || '').toLowerCase();
-                        if (ot.includes('$safeTxt'.toLowerCase())) { chosenIdx = i; break; }
+                let el = $elementId > 0 ? document.querySelector('[data-ai-id="$elementId"]') : null;
+                if (!el || el.tagName.toLowerCase() !== 'select') {
+                    const allSelects = document.querySelectorAll('select');
+                    if (allSelects.length > 0) el = allSelects[0];
+                }
+                if (!el) return JSON.stringify({ status: 'error', message: 'Select element not found' });
+
+                if (el.tagName.toLowerCase() === 'select') {
+                    let chosenIdx = -1;
+                    if ($index >= 0 && $index < el.options.length) {
+                        chosenIdx = $index;
+                    } else {
+                        const qVal = '$safeVal'.trim().toLowerCase();
+                        const qTxt = '$safeTxt'.trim().toLowerCase();
+                        for (let i = 0; i < el.options.length; i++) {
+                            const ov = (el.options[i].value || '').trim().toLowerCase();
+                            const ot = (el.options[i].text || el.options[i].label || '').trim().toLowerCase();
+                            if ((qVal && (ov === qVal || ot === qVal)) || (qTxt && (ot === qTxt || ov === qTxt)) || (qTxt && ot.includes(qTxt))) {
+                                chosenIdx = i;
+                                break;
+                            }
+                        }
                     }
+
+                    if (chosenIdx >= 0) {
+                        const opt = el.options[chosenIdx];
+                        el.selectedIndex = chosenIdx;
+                        el.value = opt.value;
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                        const modal = document.getElementById('__ai_select_modal');
+                        if (modal) modal.remove();
+                        return JSON.stringify({
+                            status: 'selected',
+                            selected_index: chosenIdx,
+                            selected_value: opt.value,
+                            selected_text: (opt.text || '').trim()
+                        });
+                    }
+                    return JSON.stringify({ status: 'option_not_found' });
                 }
-                if (chosenIdx >= 0 && chosenIdx < el.options.length) {
-                    el.selectedIndex = chosenIdx;
-                    el.value = el.options[chosenIdx].value;
-                    el.dispatchEvent(new Event('change', { bubbles: true }));
-                    return JSON.stringify({ status: 'selected', index: chosenIdx });
-                }
-                return JSON.stringify({ status: 'option_not_found' });
+                el.click();
+                return JSON.stringify({ status: 'clicked' });
             })();
         """.trimIndent())
-        return res
+        return if (res.startsWith("{")) res else JSONObject().put("status", res).put("element_id", elementId).toString()
     }
 
     private fun performHumanTypingSync(elementId: Int, text: String, clear: Boolean, submit: Boolean, instant: Boolean): String {
         if (elementId > 0) {
             performSmartClickSync(elementId, -1f, -1f)
-            Thread.sleep(120)
+            Thread.sleep(160)
         }
 
         if (clear) {
@@ -1521,47 +1729,85 @@ class MainActivity : Activity() {
             return performCodeEditorActionSync(JSONObject().put("action", "insert").put("text", text))
         }
 
-        for (ch in text) {
-            if (isEmergencyStopped.get()) break
-            val safe = ch.toString().replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n").replace("\r", "")
+        for (i in 0 until text.length) {
+            if (isEmergencyStopped.get()) {
+                return JSONObject().put("status", "stopped").toString()
+            }
+            val ch = text[i]
+            val safe = ch.toString()
+                .replace("\\", "\\\\")
+                .replace("'", "\\'")
+                .replace("\n", "\\n")
+                .replace("\r", "")
+
             val js = """
                 (function() {
                     let el = document.activeElement;
                     if (!el || el === document.body) {
-                        el = document.querySelector('input:focus, textarea:focus, [contenteditable="true"]');
+                        el = document.querySelector('.cm-content[contenteditable="true"], .monaco-editor textarea.inputarea, [contenteditable="true"], input:focus, textarea:focus');
+                        if (el) el.focus();
                     }
-                    if (!el) return;
-                    if (el.isContentEditable) {
+                    if (!el) return 'no_element';
+
+                    el.dispatchEvent(new KeyboardEvent('keydown', { key: '$safe', bubbles: true, cancelable: true }));
+
+                    if (el.isContentEditable || el.getAttribute('contenteditable') === 'true' || el.classList.contains('inputarea')) {
                         document.execCommand('insertText', false, '$safe');
                     } else if ('value' in el) {
-                        el.value = (el.value || '') + '$safe';
-                        el.dispatchEvent(new InputEvent('input', { data: '$safe', bubbles: true }));
+                        const proto = el.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+                        const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+                        const nextVal = (el.value || '') + '$safe';
+                        if (desc && desc.set) desc.set.call(el, nextVal);
+                        else el.value = nextVal;
+                        el.dispatchEvent(new InputEvent('input', { data: '$safe', inputType: 'insertText', bubbles: true }));
                     }
+                    el.dispatchEvent(new KeyboardEvent('keyup', { key: '$safe', bubbles: true }));
+                    return 'ok';
                 })();
             """.trimIndent()
             evalJsSync(js)
-            Thread.sleep((25..65).random().toLong())
+            Thread.sleep((35..95).random().toLong())
         }
 
         if (submit) {
             performSpecialKeySync("Enter")
+            evalJsSync("(function(){ const el = document.activeElement; if (el && el.form) el.form.submit(); })()")
         }
 
-        return JSONObject().put("status", "typed").put("length", text.length).toString()
+        return JSONObject()
+            .put("status", "typed")
+            .put("length", text.length)
+            .put("submitted", submit)
+            .toString()
     }
 
     private fun performCodeEditorActionSync(body: JSONObject): String {
         val action = body.optString("action", "get_code").lowercase(Locale.ROOT)
-        val text = body.optString("text", "")
+        val inputB64 = body.optString("text_b64", "")
+        val text = if (inputB64.isNotEmpty()) {
+            try { String(Base64.decode(inputB64, Base64.DEFAULT), Charsets.UTF_8) } catch (_: Exception) { "" }
+        } else {
+            body.optString("text", "")
+        }
         val b64Text = Base64.encodeToString(text.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
 
         val js = """
             (function() {
                 const action = '$action';
-                const rawText = atob('$b64Text');
+                function decodeB64Utf8(b64) {
+                    if (!b64) return '';
+                    try {
+                        const bin = atob(b64);
+                        const bytes = new Uint8Array(bin.length);
+                        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                        return new TextDecoder('utf-8').decode(bytes);
+                    } catch (e) { return ''; }
+                }
+                const rawText = decodeB64Utf8('$b64Text');
                 let target = document.activeElement;
                 if (!target || target === document.body) {
-                    target = document.querySelector('[contenteditable="true"], textarea, input');
+                    target = document.querySelector('.cm-content[contenteditable="true"], [contenteditable="true"], textarea, input');
+                    if (target) target.focus();
                 }
                 if (!target) return JSON.stringify({ status: 'no_target' });
 
@@ -1571,18 +1817,16 @@ class MainActivity : Activity() {
                     target.dispatchEvent(new Event('input', { bubbles: true }));
                     return JSON.stringify({ status: 'cleared' });
                 }
-
                 if (action === 'insert' || action === 'paste' || action === 'set_code') {
                     if (target.isContentEditable) {
-                        target.focus();
+                        if (action === 'set_code') target.innerText = '';
                         document.execCommand('insertText', false, rawText);
                     } else {
-                        target.value = (action === 'set_code' ? rawText : (target.value + rawText));
+                        target.value = action === 'set_code' ? rawText : (target.value + rawText);
                         target.dispatchEvent(new Event('input', { bubbles: true }));
                     }
                     return JSON.stringify({ status: 'ok', length: rawText.length });
                 }
-
                 return JSON.stringify({ status: 'ok', content: (target.value || target.innerText || '') });
             })();
         """.trimIndent()
@@ -1596,6 +1840,10 @@ class MainActivity : Activity() {
             "enter" -> KeyEvent.KEYCODE_ENTER
             "tab" -> KeyEvent.KEYCODE_TAB
             "escape", "esc" -> KeyEvent.KEYCODE_ESCAPE
+            "up", "arrowup" -> KeyEvent.KEYCODE_DPAD_UP
+            "down", "arrowdown" -> KeyEvent.KEYCODE_DPAD_DOWN
+            "left", "arrowleft" -> KeyEvent.KEYCODE_DPAD_LEFT
+            "right", "arrowright" -> KeyEvent.KEYCODE_DPAD_RIGHT
             else -> KeyEvent.KEYCODE_ENTER
         }
         runOnMainSync {
@@ -1608,7 +1856,9 @@ class MainActivity : Activity() {
     private fun performSmoothScrollSync(dx: Float, dy: Float, elementId: Int): String {
         evalJsSync("""
             (function() {
-                window.scrollBy({ left: $dx, top: $dy, behavior: 'smooth' });
+                let el = $elementId > 0 ? document.querySelector('[data-ai-id="$elementId"]') : null;
+                if (el) el.scrollBy({ left: $dx, top: $dy, behavior: 'smooth' });
+                else window.scrollBy({ left: $dx, top: $dy, behavior: 'smooth' });
             })();
         """.trimIndent())
         return JSONObject().put("status", "scrolled").put("dx", dx).put("dy", dy).toString()
@@ -1623,7 +1873,7 @@ class MainActivity : Activity() {
             if (found == "true") {
                 return JSONObject().put("status", "found").put("selector", selector).toString()
             }
-            Thread.sleep(200)
+            Thread.sleep(250)
         }
         return JSONObject().put("status", "timeout").put("selector", selector).toString()
     }
@@ -1697,6 +1947,10 @@ class MainActivity : Activity() {
                                             .put("text", txt)
                                             .put("x", cx)
                                             .put("y", cy)
+                                            .put("left", left)
+                                            .put("top", top)
+                                            .put("right", right)
+                                            .put("bottom", bottom)
                                     )
                                     overlayBoxes.add(
                                         Pair(
@@ -1726,6 +1980,8 @@ class MainActivity : Activity() {
             .put("status", "ok")
             .put("url", currentUrl)
             .put("title", currentTitle)
+            .put("mode", mode)
+            .put("ocr_screen_text", ocrFullText)
             .put("ocr_blocks_count", ocrBlocksArray.length())
             .put("ocr_blocks", ocrBlocksArray)
             .toString()
