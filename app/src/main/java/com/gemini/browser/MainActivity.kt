@@ -33,18 +33,52 @@ import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.*
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 @SuppressLint("SetJavaScriptEnabled", "ClickableViewAccessibility")
 class MainActivity : Activity() {
 
+    class BrowserTab(
+        val id: Int,
+        val webView: WebView,
+        @Volatile var url: String = "https://gemini.google.com",
+        @Volatile var title: String = "New Tab",
+        @Volatile var desktopMode: Boolean = false,
+        @Volatile var isPageLoading: Boolean = false,
+        @Volatile var isNetworkIdle: Boolean = true
+    )
+
+    private lateinit var tabBarContainer: LinearLayout
     private lateinit var webContainer: FrameLayout
-    private lateinit var webView: WebView
+    private lateinit var tabViewsHolder: FrameLayout
     private lateinit var overlayView: AIOverlayView
     private lateinit var urlInput: EditText
     private lateinit var consoleText: TextView
     private lateinit var logPanel: TextView
     private lateinit var desktopBtn: Button
     private lateinit var prefs: SharedPreferences
+
+    private val tabs = CopyOnWriteArrayList<BrowserTab>()
+    private val nextTabId = AtomicInteger(1)
+    @Volatile private var activeTab: BrowserTab? = null
+
+    private val webView: WebView
+        get() = (activeTab ?: tabs.first()).webView
+
+    private val desktopMode: Boolean
+        get() = activeTab?.desktopMode ?: false
+
+    private val isPageLoading: Boolean
+        get() = activeTab?.isPageLoading ?: false
+
+    private val isNetworkIdle: Boolean
+        get() = activeTab?.isNetworkIdle ?: true
+
+    private val currentUrl: String
+        get() = activeTab?.url ?: "https://gemini.google.com"
+
+    private val currentTitle: String
+        get() = activeTab?.title ?: ""
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val serverPool: ExecutorService = Executors.newCachedThreadPool()
@@ -54,11 +88,6 @@ class MainActivity : Activity() {
     private val commandLogs = LinkedList<String>()
     private val sseClients = CopyOnWriteArrayList<PrintWriter>()
 
-    @Volatile private var desktopMode = false
-    @Volatile private var isPageLoading = false
-    @Volatile private var isNetworkIdle = true
-    @Volatile private var currentUrl = "https://gemini.google.com"
-    @Volatile private var currentTitle = ""
     @Volatile private var queuedFilePath: String? = null
 
     // Pure Chrome User-Agent (Bypasses Google Login "unauthorized/disallowed_useragent" error)
@@ -85,11 +114,11 @@ class MainActivity : Activity() {
             wakeLock?.acquire()
         } catch (_: Exception) {}
 
-        buildUserInterface()
-        configureWebView()
-        ensureServerRunning()
+        CookieManager.getInstance().setAcceptCookie(true)
 
-        webView.loadUrl(currentUrl)
+        buildUserInterface()
+        createNewTab("https://gemini.google.com", switchToIt = true)
+        ensureServerRunning()
     }
 
     override fun onResume() {
@@ -135,11 +164,34 @@ class MainActivity : Activity() {
             )
         }
 
+        // 1. Horizontally Scrollable Multi-Tab Bar
+        val tabBarScroll = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            overScrollMode = View.OVER_SCROLL_ALWAYS
+            setBackgroundColor(Color.parseColor("#141414"))
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
+
+        tabBarContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(6), dp(5), dp(6), dp(5))
+            layoutParams = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
+        tabBarScroll.addView(tabBarContainer)
+
+        // 2. Navigation Bar
         val navBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setBackgroundColor(Color.parseColor("#1F1F1F"))
-            setPadding(dp(6), dp(6), dp(6), dp(6))
+            setPadding(dp(6), dp(5), dp(6), dp(5))
         }
 
         val btnBack = makeSmallButton("◀") { if (webView.canGoBack()) webView.goBack() }
@@ -182,7 +234,7 @@ class MainActivity : Activity() {
         navBar.addView(btnGo)
         navBar.addView(desktopBtn)
 
-        // Horizontally Draggable/Scrollable Panel for DOM, OCR, JS, LOGS, STOP & Console Status
+        // 3. Horizontally Draggable/Scrollable Action Panel
         val consoleScroll = HorizontalScrollView(this).apply {
             isHorizontalScrollBarEnabled = false
             isFillViewport = false
@@ -268,6 +320,7 @@ class MainActivity : Activity() {
         consoleRow.addView(consoleText)
         consoleScroll.addView(consoleRow)
 
+        // 4. WebView Container + Multi-Tab Holder + AI Overlay
         webContainer = FrameLayout(this).apply {
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -281,7 +334,7 @@ class MainActivity : Activity() {
             }
         }
 
-        webView = WebView(this).apply {
+        tabViewsHolder = FrameLayout(this).apply {
             layoutParams = FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
@@ -297,7 +350,7 @@ class MainActivity : Activity() {
             )
         }
 
-        webContainer.addView(webView)
+        webContainer.addView(tabViewsHolder)
         webContainer.addView(overlayView)
 
         logPanel = TextView(this).apply {
@@ -312,15 +365,147 @@ class MainActivity : Activity() {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 dp(110)
             )
-            text = "[System] Gemini Browser Ready on port $SERVER_PORT...\n"
+            text = "[System] Gemini Multi-Tab Browser Ready on port $SERVER_PORT...\n"
         }
 
+        root.addView(tabBarScroll)
         root.addView(navBar)
         root.addView(consoleScroll)
         root.addView(webContainer)
         root.addView(logPanel)
 
         setContentView(root)
+    }
+
+    // ==================== MULTI-TAB ENGINE (UI + STATE) ====================
+
+    private fun createNewTab(initialUrl: String = "https://gemini.google.com", switchToIt: Boolean = true): BrowserTab {
+        val id = nextTabId.getAndIncrement()
+        val wv = WebView(this).apply {
+            layoutParams = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+            visibility = View.GONE
+        }
+        val newTab = BrowserTab(id = id, webView = wv, url = initialUrl, title = "Tab $id")
+        configureWebViewForTab(newTab)
+        tabs.add(newTab)
+        tabViewsHolder.addView(wv)
+
+        if (switchToIt || activeTab == null) {
+            switchToTab(newTab)
+        } else {
+            refreshTabBarUi()
+        }
+
+        wv.loadUrl(initialUrl)
+        appendLog("➕ Opened Tab #$id -> $initialUrl")
+        return newTab
+    }
+
+    private fun switchToTab(targetTab: BrowserTab) {
+        if (!tabs.contains(targetTab)) return
+        activeTab = targetTab
+        for (t in tabs) {
+            t.webView.visibility = if (t.id == targetTab.id) View.VISIBLE else View.GONE
+        }
+        urlInput.setText(targetTab.url)
+        desktopBtn.text = if (targetTab.desktopMode) "PC" else "MOB"
+        desktopBtn.setBackgroundColor(if (targetTab.desktopMode) Color.parseColor("#1565C0") else Color.parseColor("#333333"))
+        updateWebViewViewportBounds(targetTab)
+        overlayView.clearHighlights()
+        refreshTabBarUi()
+        appendLog("🔄 Switched to Tab #${targetTab.id}")
+    }
+
+    private fun closeTab(targetTab: BrowserTab) {
+        if (tabs.size <= 1) {
+            // If it's the last remaining tab, reset it to Gemini home
+            targetTab.webView.loadUrl("https://gemini.google.com")
+            Toast.makeText(this, "Reset Tab #${targetTab.id}", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val idx = tabs.indexOf(targetTab)
+        val wasActive = (activeTab?.id == targetTab.id)
+        tabs.remove(targetTab)
+        tabViewsHolder.removeView(targetTab.webView)
+        try {
+            targetTab.webView.stopLoading()
+            targetTab.webView.destroy()
+        } catch (_: Exception) {}
+
+        appendLog("✕ Closed Tab #${targetTab.id}")
+
+        if (wasActive && tabs.isNotEmpty()) {
+            val nextIdx = idx.coerceIn(0, tabs.size - 1)
+            switchToTab(tabs[nextIdx])
+        } else {
+            refreshTabBarUi()
+        }
+    }
+
+    private fun refreshTabBarUi() {
+        mainHandler.post {
+            tabBarContainer.removeAllViews()
+            val curId = activeTab?.id ?: -1
+
+            for (t in tabs) {
+                val isCurrent = (t.id == curId)
+                val tabBox = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    setBackgroundColor(Color.parseColor(if (isCurrent) "#1565C0" else "#252525"))
+                    setPadding(dp(8), dp(3), dp(4), dp(3))
+                    layoutParams = LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        dp(28)
+                    ).apply { marginEnd = dp(5) }
+                    setOnClickListener { switchToTab(t) }
+                }
+
+                val cleanTitle = t.title.ifEmpty { t.url.removePrefix("https://").removePrefix("http://") }.take(16)
+                val titleTv = TextView(this).apply {
+                    text = "${t.id}: $cleanTitle"
+                    setTextColor(Color.WHITE)
+                    textSize = 10.5f
+                    typeface = if (isCurrent) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
+                    setSingleLine(true)
+                    setPadding(0, 0, dp(6), 0)
+                }
+
+                val closeBtn = TextView(this).apply {
+                    text = "✕"
+                    setTextColor(Color.parseColor(if (isCurrent) "#FFCDD2" else "#AAAAAA"))
+                    textSize = 10.5f
+                    typeface = Typeface.DEFAULT_BOLD
+                    setPadding(dp(5), dp(1), dp(5), dp(1))
+                    setOnClickListener { closeTab(t) }
+                }
+
+                tabBox.addView(titleTv)
+                tabBox.addView(closeBtn)
+                tabBarContainer.addView(tabBox)
+            }
+
+            // "+ Tab" Button at the end of Tab Bar
+            val addTabBtn = Button(this).apply {
+                text = "+ TAB"
+                textSize = 10f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(Color.WHITE)
+                setBackgroundColor(Color.parseColor("#00897B"))
+                minWidth = 0; minimumWidth = 0
+                minHeight = 0; minimumHeight = 0
+                setPadding(dp(10), dp(2), dp(10), dp(2))
+                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(28))
+                setOnClickListener {
+                    createNewTab("https://gemini.google.com", switchToIt = true)
+                }
+            }
+            tabBarContainer.addView(addTabBtn)
+        }
     }
 
     // ==================== DOWNLOAD ENGINE (HTTP/HTTPS + BLOB + DATA URLs) ====================
@@ -498,7 +683,7 @@ class MainActivity : Activity() {
                 setPadding(dp(6), dp(2), dp(6), dp(2))
                 layoutParams = LinearLayout.LayoutParams(dp(48), dp(28)).apply { marginEnd = dp(4) }
                 setOnClickListener {
-                    runSingleUserScriptOnPage(sName, sCode)
+                    runSingleUserScriptOnPage(webView, sName, sCode)
                     Toast.makeText(this@MainActivity, "Executed: $sName", Toast.LENGTH_SHORT).show()
                 }
             }
@@ -638,7 +823,7 @@ class MainActivity : Activity() {
             setOnClickListener {
                 val jsCode = codeInput.text.toString()
                 if (jsCode.trim().isNotEmpty()) {
-                    runSingleUserScriptOnPage(nameInput.text.toString().ifEmpty { "TempScript" }, jsCode)
+                    runSingleUserScriptOnPage(webView, nameInput.text.toString().ifEmpty { "TempScript" }, jsCode)
                     Toast.makeText(this@MainActivity, "Script Executed!", Toast.LENGTH_SHORT).show()
                     dialogRef?.dismiss()
                 }
@@ -662,7 +847,7 @@ class MainActivity : Activity() {
                 val entry = JSONObject().put("name", sName).put("code", jsCode).put("enabled", true)
                 if (editIndex in 0 until scripts.length()) scripts.put(editIndex, entry) else scripts.put(entry)
                 saveUserScripts(scripts)
-                runSingleUserScriptOnPage(sName, jsCode)
+                runSingleUserScriptOnPage(webView, sName, jsCode)
                 Toast.makeText(this@MainActivity, "Saved & Executed: $sName", Toast.LENGTH_SHORT).show()
                 dialogRef?.dismiss()
             }
@@ -696,7 +881,7 @@ class MainActivity : Activity() {
         return false
     }
 
-    private fun runSingleUserScriptOnPage(name: String, rawCode: String) {
+    private fun runSingleUserScriptOnPage(targetWv: WebView, name: String, rawCode: String) {
         val b64 = Base64.encodeToString(rawCode.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
         val safeName = name.replace("'", "\\'")
         val js = """
@@ -721,12 +906,12 @@ class MainActivity : Activity() {
             })();
         """.trimIndent()
         mainHandler.post {
-            webView.evaluateJavascript(js, null)
+            targetWv.evaluateJavascript(js, null)
             appendLog("UserScript ran: $name")
         }
     }
 
-    private fun injectSavedUserScripts(url: String) {
+    private fun injectSavedUserScripts(targetWv: WebView, url: String) {
         val scripts = getSavedUserScripts()
         for (i in 0 until scripts.length()) {
             val obj = scripts.optJSONObject(i) ?: continue
@@ -734,7 +919,7 @@ class MainActivity : Activity() {
                 val name = obj.optString("name", "Script #$i")
                 val code = obj.optString("code", "")
                 if (code.isNotEmpty() && scriptMatchesUrl(code, url)) {
-                    runSingleUserScriptOnPage(name, code)
+                    runSingleUserScriptOnPage(targetWv, name, code)
                 }
             }
         }
@@ -742,56 +927,59 @@ class MainActivity : Activity() {
 
     // ==================== VIEWPORT & WEBVIEW CONFIG ====================
 
-    private fun updateWebViewViewportBounds() {
+    private fun updateWebViewViewportBounds(targetTab: BrowserTab? = activeTab) {
+        val tab = targetTab ?: return
+        val wv = tab.webView
         val cw = webContainer.width
         val ch = webContainer.height
         if (cw <= 0 || ch <= 0) return
 
-        if (desktopMode) {
+        if (tab.desktopMode) {
             val density = resources.displayMetrics.density
             val targetCssWidth = 1280f
             val targetPxW = (targetCssWidth * density).toInt()
             val scale = cw.toFloat() / targetPxW.toFloat()
             val targetPxH = (ch.toFloat() / scale).toInt()
 
-            webView.pivotX = 0f
-            webView.pivotY = 0f
-            webView.scaleX = scale
-            webView.scaleY = scale
+            wv.pivotX = 0f
+            wv.pivotY = 0f
+            wv.scaleX = scale
+            wv.scaleY = scale
 
-            val lp = webView.layoutParams as FrameLayout.LayoutParams
+            val lp = wv.layoutParams as FrameLayout.LayoutParams
             if (lp.width != targetPxW || lp.height != targetPxH) {
                 lp.width = targetPxW
                 lp.height = targetPxH
-                webView.layoutParams = lp
+                wv.layoutParams = lp
             }
         } else {
-            webView.pivotX = 0f
-            webView.pivotY = 0f
-            webView.scaleX = 1f
-            webView.scaleY = 1f
+            wv.pivotX = 0f
+            wv.pivotY = 0f
+            wv.scaleX = 1f
+            wv.scaleY = 1f
 
-            val lp = webView.layoutParams as FrameLayout.LayoutParams
+            val lp = wv.layoutParams as FrameLayout.LayoutParams
             if (lp.width != ViewGroup.LayoutParams.MATCH_PARENT || lp.height != ViewGroup.LayoutParams.MATCH_PARENT) {
                 lp.width = ViewGroup.LayoutParams.MATCH_PARENT
                 lp.height = ViewGroup.LayoutParams.MATCH_PARENT
-                webView.layoutParams = lp
+                wv.layoutParams = lp
             }
         }
     }
 
     private fun applyDesktopMode(enable: Boolean) {
-        desktopMode = enable
+        val tab = activeTab ?: return
+        tab.desktopMode = enable
         runOnUiThread {
-            desktopBtn.text = if (desktopMode) "PC" else "MOB"
-            desktopBtn.setBackgroundColor(if (desktopMode) Color.parseColor("#1565C0") else Color.parseColor("#333333"))
-            webView.settings.userAgentString = if (desktopMode) desktopUA else mobileUA
-            webView.settings.useWideViewPort = true
-            webView.settings.loadWithOverviewMode = true
-            updateWebViewViewportBounds()
-            webView.reload()
+            desktopBtn.text = if (enable) "PC" else "MOB"
+            desktopBtn.setBackgroundColor(if (enable) Color.parseColor("#1565C0") else Color.parseColor("#333333"))
+            tab.webView.settings.userAgentString = if (enable) desktopUA else mobileUA
+            tab.webView.settings.useWideViewPort = true
+            tab.webView.settings.loadWithOverviewMode = true
+            updateWebViewViewportBounds(tab)
+            tab.webView.reload()
         }
-        appendLog("Desktop Mode (1280px) -> $desktopMode")
+        appendLog("Tab #${tab.id} Desktop Mode -> $enable")
     }
 
     private fun makeSmallButton(label: String, onClick: () -> Unit): Button {
@@ -823,8 +1011,9 @@ class MainActivity : Activity() {
         webView.loadUrl(raw)
     }
 
-    private fun configureWebView() {
-        val s = webView.settings
+    private fun configureWebViewForTab(tab: BrowserTab) {
+        val wv = tab.webView
+        val s = wv.settings
         s.javaScriptEnabled = true
         s.domStorageEnabled = true
         s.databaseEnabled = true
@@ -838,30 +1027,28 @@ class MainActivity : Activity() {
         s.builtInZoomControls = true
         s.displayZoomControls = false
         s.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-        s.userAgentString = mobileUA
+        s.userAgentString = if (tab.desktopMode) desktopUA else mobileUA
 
-        CookieManager.getInstance().setAcceptCookie(true)
-        CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
+        CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
 
-        // Attach DownloadListener for all browser downloads
-        webView.setDownloadListener { url, userAgent, contentDisposition, mimetype, _ ->
+        wv.setDownloadListener { url, userAgent, contentDisposition, mimetype, _ ->
             startBrowserDownload(url, userAgent, contentDisposition, mimetype)
         }
 
-        webView.addJavascriptInterface(object {
+        wv.addJavascriptInterface(object {
             @JavascriptInterface
             fun onIdle(url: String) {
-                isNetworkIdle = true
+                tab.isNetworkIdle = true
                 broadcastSse("network_idle", url)
-                if (serverStarted.get()) {
-                    setConsoleStatus("🟢 ONLINE 127.0.0.1:$SERVER_PORT | AI: Idle", false)
+                if (serverStarted.get() && activeTab?.id == tab.id) {
+                    setConsoleStatus("🟢 ONLINE 127.0.0.1:$SERVER_PORT | Tab #${tab.id} Idle", false)
                 }
             }
 
             @JavascriptInterface
             fun onAutoAllowed(toolInfo: String) {
-                appendLog("⚡ Auto-Clicked Latest Allow: $toolInfo")
-                setConsoleStatus("🟢 Auto-Allowed MCP Tool!", false)
+                appendLog("⚡ [Tab #${tab.id}] Auto-Clicked Latest Allow: $toolInfo")
+                setConsoleStatus("🟢 [Tab #${tab.id}] Auto-Allowed MCP Tool!", false)
                 broadcastSse("auto_allow_clicked", toolInfo)
             }
 
@@ -876,40 +1063,54 @@ class MainActivity : Activity() {
             }
         }, "AIAgentBridge")
 
-        webView.webViewClient = object : WebViewClient() {
+        wv.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                 return false
             }
 
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                 super.onPageStarted(view, url, favicon)
-                isPageLoading = true
-                isNetworkIdle = false
-                currentUrl = url ?: ""
-                urlInput.setText(currentUrl)
-                injectStealthViewportAndTracker()
-                if (serverStarted.get()) {
-                    setConsoleStatus("🟢 127.0.0.1:$SERVER_PORT | Loading...", false)
+                tab.isPageLoading = true
+                tab.isNetworkIdle = false
+                tab.url = url ?: ""
+                if (activeTab?.id == tab.id) {
+                    urlInput.setText(tab.url)
+                    if (serverStarted.get()) {
+                        setConsoleStatus("🟢 127.0.0.1:$SERVER_PORT | Tab #${tab.id} Loading...", false)
+                    }
                 }
+                injectStealthViewportAndTracker(tab)
+                refreshTabBarUi()
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
-                isPageLoading = false
-                currentUrl = url ?: ""
-                currentTitle = view?.title ?: ""
-                urlInput.setText(currentUrl)
-                CookieManager.getInstance().flush()
-                injectStealthViewportAndTracker()
-                injectSavedUserScripts(currentUrl)
-                broadcastSse("page_loaded", currentUrl)
-                if (serverStarted.get()) {
-                    setConsoleStatus("🟢 ONLINE 127.0.0.1:$SERVER_PORT | AI: Ready", false)
+                tab.isPageLoading = false
+                tab.url = url ?: ""
+                tab.title = view?.title ?: "Tab ${tab.id}"
+                if (activeTab?.id == tab.id) {
+                    urlInput.setText(tab.url)
+                    if (serverStarted.get()) {
+                        setConsoleStatus("🟢 ONLINE 127.0.0.1:$SERVER_PORT | Tab #${tab.id} Ready", false)
+                    }
                 }
+                CookieManager.getInstance().flush()
+                injectStealthViewportAndTracker(tab)
+                injectSavedUserScripts(wv, tab.url)
+                refreshTabBarUi()
+                broadcastSse("page_loaded", tab.url)
             }
         }
 
-        webView.webChromeClient = object : WebChromeClient() {
+        wv.webChromeClient = object : WebChromeClient() {
+            override fun onReceivedTitle(view: WebView?, title: String?) {
+                super.onReceivedTitle(view, title)
+                if (!title.isNullOrBlank()) {
+                    tab.title = title
+                    refreshTabBarUi()
+                }
+            }
+
             override fun onJsAlert(view: WebView?, url: String?, message: String?, result: JsResult?): Boolean {
                 appendLog("Auto-Accepted Alert: $message")
                 result?.confirm()
@@ -949,8 +1150,8 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun injectStealthViewportAndTracker() {
-        val isPc = if (desktopMode) "true" else "false"
+    private fun injectStealthViewportAndTracker(tab: BrowserTab) {
+        val isPc = if (tab.desktopMode) "true" else "false"
         val js = """
             (function() {
                 try {
@@ -1114,7 +1315,7 @@ class MainActivity : Activity() {
                 checkIdle();
             })();
         """.trimIndent()
-        webView.evaluateJavascript(js, null)
+        tab.webView.evaluateJavascript(js, null)
     }
 
     private fun ensureServerRunning() {
@@ -1222,6 +1423,73 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun buildTabsJsonArray(): JSONArray {
+        val arr = JSONArray()
+        val curId = activeTab?.id ?: -1
+        for (t in tabs) {
+            arr.put(
+                JSONObject()
+                    .put("tab_id", t.id)
+                    .put("active", t.id == curId)
+                    .put("url", t.url)
+                    .put("title", t.title)
+                    .put("loading", t.isPageLoading)
+                    .put("desktop_mode", t.desktopMode)
+            )
+        }
+        return arr
+    }
+
+    private fun handleTabsApiSync(body: JSONObject?): String {
+        val action = body?.optString("action", "list")?.lowercase(Locale.ROOT) ?: "list"
+        return when (action) {
+            "list" -> {
+                JSONObject()
+                    .put("status", "ok")
+                    .put("active_tab_id", activeTab?.id ?: -1)
+                    .put("tabs_count", tabs.size)
+                    .put("tabs", buildTabsJsonArray())
+                    .toString()
+            }
+            "new", "open", "create" -> {
+                val url = body?.optString("url", "https://gemini.google.com") ?: "https://gemini.google.com"
+                val switchToIt = body?.optBoolean("switch", true) ?: true
+                var createdTab: BrowserTab? = null
+                runOnMainSync {
+                    createdTab = createNewTab(url, switchToIt)
+                }
+                JSONObject()
+                    .put("status", "tab_created")
+                    .put("tab_id", createdTab?.id ?: -1)
+                    .put("active_tab_id", activeTab?.id ?: -1)
+                    .put("tabs_count", tabs.size)
+                    .toString()
+            }
+            "switch", "select" -> {
+                val targetId = body?.optInt("tab_id", -1) ?: -1
+                val targetTab = tabs.find { it.id == targetId }
+                    ?: body?.optInt("index", -1)?.let { idx -> if (idx in 0 until tabs.size) tabs[idx] else null }
+                if (targetTab != null) {
+                    runOnMainSync { switchToTab(targetTab) }
+                    JSONObject().put("status", "switched").put("active_tab_id", targetTab.id).put("url", targetTab.url).toString()
+                } else {
+                    JSONObject().put("status", "error").put("message", "Tab not found").toString()
+                }
+            }
+            "close" -> {
+                val targetId = body?.optInt("tab_id", activeTab?.id ?: -1) ?: (activeTab?.id ?: -1)
+                val targetTab = tabs.find { it.id == targetId }
+                if (targetTab != null) {
+                    runOnMainSync { closeTab(targetTab) }
+                    JSONObject().put("status", "closed").put("closed_tab_id", targetId).put("active_tab_id", activeTab?.id ?: -1).toString()
+                } else {
+                    JSONObject().put("status", "error").put("message", "Tab not found").toString()
+                }
+            }
+            else -> JSONObject().put("status", "error").put("message", "Unknown tab action: $action").toString()
+        }
+    }
+
     private fun executeCommand(method: String, path: String, body: JSONObject?): String {
         isEmergencyStopped.set(false)
         appendLog("$method $path")
@@ -1233,6 +1501,9 @@ class MainActivity : Activity() {
                     .put("status", "online")
                     .put("browser", "Gemini Browser")
                     .put("port", SERVER_PORT)
+                    .put("active_tab_id", activeTab?.id ?: -1)
+                    .put("tabs_count", tabs.size)
+                    .put("tabs", buildTabsJsonArray())
                     .put("url", currentUrl)
                     .put("title", currentTitle)
                     .put("loading", isPageLoading)
@@ -1241,6 +1512,8 @@ class MainActivity : Activity() {
                     .put("userscripts_count", getSavedUserScripts().length())
                     .toString()
             }
+
+            "/tabs" -> handleTabsApiSync(body)
 
             "/desktop" -> {
                 val enable = body?.optBoolean("enable", !desktopMode) ?: !desktopMode
@@ -1259,13 +1532,18 @@ class MainActivity : Activity() {
             "/navigate" -> {
                 val targetUrl = body?.optString("url", "https://gemini.google.com") ?: "https://gemini.google.com"
                 val waitIdle = body?.optBoolean("wait_idle", true) ?: true
-                if (body?.has("desktop_mode") == true) {
-                    val wantPc = body.optBoolean("desktop_mode", desktopMode)
-                    if (wantPc != desktopMode) applyDesktopMode(wantPc)
+                val openInNewTab = body?.optBoolean("new_tab", false) ?: false
+                if (openInNewTab) {
+                    runOnMainSync { createNewTab(targetUrl, switchToIt = true) }
+                } else {
+                    if (body?.has("desktop_mode") == true) {
+                        val wantPc = body.optBoolean("desktop_mode", desktopMode)
+                        if (wantPc != desktopMode) applyDesktopMode(wantPc)
+                    }
+                    activeTab?.isPageLoading = true
+                    activeTab?.isNetworkIdle = false
+                    runOnMainSync { webView.loadUrl(targetUrl) }
                 }
-                isPageLoading = true
-                isNetworkIdle = false
-                runOnMainSync { webView.loadUrl(targetUrl) }
                 if (waitIdle) {
                     val start = System.currentTimeMillis()
                     while (System.currentTimeMillis() - start < 8000) {
@@ -1275,6 +1553,7 @@ class MainActivity : Activity() {
                 }
                 JSONObject()
                     .put("status", "navigating")
+                    .put("tab_id", activeTab?.id ?: -1)
                     .put("url", currentUrl)
                     .put("title", currentTitle)
                     .put("desktop_mode", desktopMode)
@@ -1294,6 +1573,7 @@ class MainActivity : Activity() {
                 """.trimIndent())
                 JSONObject()
                     .put("status", "ok")
+                    .put("tab_id", activeTab?.id ?: -1)
                     .put("url", currentUrl)
                     .put("title", currentTitle)
                     .put("content", text)
@@ -1310,6 +1590,7 @@ class MainActivity : Activity() {
                 val b64 = captureViewportBase64Sync()
                 JSONObject()
                     .put("status", "ok")
+                    .put("tab_id", activeTab?.id ?: -1)
                     .put("url", currentUrl)
                     .put("image_base64", b64)
                     .toString()
@@ -1392,7 +1673,7 @@ class MainActivity : Activity() {
                 val arr = getSavedUserScripts()
                 arr.put(JSONObject().put("name", name).put("code", code).put("enabled", true))
                 saveUserScripts(arr)
-                runSingleUserScriptOnPage(name, code)
+                runSingleUserScriptOnPage(webView, name, code)
                 JSONObject().put("status", "saved_and_executed").put("name", name).put("total_scripts", arr.length()).toString()
             }
             "run", "eval" -> {
@@ -1789,6 +2070,7 @@ class MainActivity : Activity() {
 
         return JSONObject()
             .put("status", "ok")
+            .put("tab_id", activeTab?.id ?: -1)
             .put("url", currentUrl)
             .put("title", currentTitle)
             .put("mode", mode)
