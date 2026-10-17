@@ -3,6 +3,7 @@ package com.gemini.browser
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AlertDialog
+import android.app.DownloadManager
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -60,11 +61,12 @@ class MainActivity : Activity() {
     @Volatile private var currentTitle = ""
     @Volatile private var queuedFilePath: String? = null
 
-    // Official Chrome Reduced User-Agent (Bypasses Google OAuth WebView Disallowed Error)
+    // Pure Chrome User-Agent (Bypasses Google Login "unauthorized/disallowed_useragent" error)
     private val mobileUA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
     private val desktopUA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
     companion object {
+        private const val SERVER_PORT = 8795
         private val serverStarted = AtomicBoolean(false)
         @Volatile private var serverSocket: ServerSocket? = null
         @Volatile private var activeInstance: MainActivity? = null
@@ -102,6 +104,25 @@ class MainActivity : Activity() {
             value.toFloat(),
             resources.displayMetrics
         ).toInt()
+    }
+
+    private fun makePanelButton(label: String, bgHex: String, widthDp: Int = 82, onClick: () -> Unit): Button {
+        return Button(this).apply {
+            text = label
+            textSize = 10.5f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+            setBackgroundColor(Color.parseColor(bgHex))
+            minWidth = 0
+            minimumWidth = 0
+            minHeight = 0
+            minimumHeight = 0
+            setPadding(dp(8), dp(2), dp(8), dp(2))
+            layoutParams = LinearLayout.LayoutParams(dp(widthDp), dp(30)).apply {
+                marginEnd = dp(5)
+            }
+            setOnClickListener { onClick() }
+        }
     }
 
     private fun buildUserInterface() {
@@ -161,118 +182,91 @@ class MainActivity : Activity() {
         navBar.addView(btnGo)
         navBar.addView(desktopBtn)
 
+        // Horizontally Draggable/Scrollable Panel for DOM, OCR, JS, LOGS, STOP & Console Status
+        val consoleScroll = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            isFillViewport = false
+            overScrollMode = View.OVER_SCROLL_ALWAYS
+            setBackgroundColor(Color.parseColor("#0A0A0A"))
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
+
         val consoleRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setBackgroundColor(Color.parseColor("#0A0A0A"))
-            setPadding(dp(6), dp(4), dp(6), dp(4))
+            setPadding(dp(6), dp(5), dp(12), dp(5))
+            layoutParams = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
+
+        val btnDomPreview = makePanelButton("DOM", "#2E7D32") {
+            serverPool.execute {
+                val arrStr = extractDomSync(true)
+                try {
+                    val arr = JSONArray(arrStr)
+                    setConsoleStatus("🟢 DOM Elements: ${arr.length()}", false)
+                } catch (_: Exception) {}
+            }
+        }
+
+        val btnOcrPreview = makePanelButton("OCR", "#00838F") {
+            serverPool.execute {
+                setConsoleStatus("🟡 Running OCR...", false)
+                val resStr = performOcrAndDeepTextSync("viewport", true)
+                try {
+                    val obj = JSONObject(resStr)
+                    val blocks = obj.optJSONArray("ocr_blocks")?.length() ?: 0
+                    val errs = obj.optJSONArray("errors_detected")?.length() ?: 0
+                    setConsoleStatus("🟢 OCR: $blocks | Err: $errs", errs > 0)
+                    appendLog("OCR Done: $blocks blocks, $errs errors")
+                } catch (_: Exception) {}
+            }
+        }
+
+        val btnUserScript = makePanelButton("JS", "#6A1B9A") {
+            showUserScriptDialog()
+        }
+
+        val btnLogs = makePanelButton("LOGS", "#37474F") {
+            logPanel.visibility = if (logPanel.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+        }
+
+        val btnStop = makePanelButton("STOP", "#D50000", 86) {
+            isEmergencyStopped.set(true)
+            webView.stopLoading()
+            overlayView.clearHighlights()
+            setConsoleStatus("🔴 [STOPPED] Kill Switch", true)
+            appendLog("EMERGENCY STOP triggered by user")
+            broadcastSse("emergency_stop", "User pressed STOP button")
+            Toast.makeText(this, "🛑 Emergency Stop Triggered", Toast.LENGTH_SHORT).show()
         }
 
         consoleText = TextView(this).apply {
-            text = "🟡 Starting 127.0.0.1:8080..."
+            text = "🟡 Starting 127.0.0.1:$SERVER_PORT..."
             setTextColor(Color.parseColor("#FFD600"))
-            textSize = 10.5f
+            textSize = 11f
             typeface = Typeface.MONOSPACE
             setSingleLine(true)
-            ellipsize = TextUtils.TruncateAt.END
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            setPadding(dp(8), 0, dp(10), 0)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
         }
 
-        val btnDomPreview = Button(this).apply {
-            text = "DOM"
-            textSize = 9.5f
-            setTextColor(Color.WHITE)
-            setBackgroundColor(Color.parseColor("#2E7D32"))
-            setPadding(dp(6), dp(2), dp(6), dp(2))
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(26)).apply {
-                marginEnd = dp(3)
-            }
-            setOnClickListener {
-                serverPool.execute {
-                    val arrStr = extractDomSync(true)
-                    try {
-                        val arr = JSONArray(arrStr)
-                        setConsoleStatus("🟢 DOM Elements: ${arr.length()}", false)
-                    } catch (_: Exception) {}
-                }
-            }
-        }
-
-        val btnOcrPreview = Button(this).apply {
-            text = "OCR"
-            textSize = 9.5f
-            setTextColor(Color.WHITE)
-            setBackgroundColor(Color.parseColor("#00838F"))
-            setPadding(dp(6), dp(2), dp(6), dp(2))
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(26)).apply {
-                marginEnd = dp(3)
-            }
-            setOnClickListener {
-                serverPool.execute {
-                    setConsoleStatus("🟡 Running OCR...", false)
-                    val resStr = performOcrAndDeepTextSync("viewport", true)
-                    try {
-                        val obj = JSONObject(resStr)
-                        val blocks = obj.optJSONArray("ocr_blocks")?.length() ?: 0
-                        val errs = obj.optJSONArray("errors_detected")?.length() ?: 0
-                        setConsoleStatus("🟢 OCR: $blocks | Err: $errs", errs > 0)
-                        appendLog("OCR Done: $blocks blocks, $errs errors")
-                    } catch (_: Exception) {}
-                }
-            }
-        }
-
-        val btnUserScript = Button(this).apply {
-            text = "JS"
-            textSize = 9.5f
-            setTextColor(Color.WHITE)
-            setBackgroundColor(Color.parseColor("#6A1B9A"))
-            setPadding(dp(6), dp(2), dp(6), dp(2))
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(26)).apply {
-                marginEnd = dp(3)
-            }
-            setOnClickListener {
-                showUserScriptDialog()
-            }
-        }
-
-        val btnLogs = Button(this).apply {
-            text = "LOGS"
-            textSize = 9.5f
-            setTextColor(Color.WHITE)
-            setBackgroundColor(Color.parseColor("#37474F"))
-            setPadding(dp(6), dp(2), dp(6), dp(2))
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(26)).apply {
-                marginEnd = dp(3)
-            }
-            setOnClickListener {
-                logPanel.visibility = if (logPanel.visibility == View.VISIBLE) View.GONE else View.VISIBLE
-            }
-        }
-
-        val btnStop = Button(this).apply {
-            text = "STOP"
-            textSize = 9.5f
-            setTextColor(Color.WHITE)
-            setBackgroundColor(Color.parseColor("#D50000"))
-            setPadding(dp(8), dp(2), dp(8), dp(2))
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(26))
-            setOnClickListener {
-                isEmergencyStopped.set(true)
-                webView.stopLoading()
-                overlayView.clearHighlights()
-                setConsoleStatus("🔴 [STOPPED] Kill Switch", true)
-                appendLog("EMERGENCY STOP triggered by user")
-                broadcastSse("emergency_stop", "User pressed STOP button")
-            }
-        }
-
-        consoleRow.addView(consoleText)
         consoleRow.addView(btnDomPreview)
         consoleRow.addView(btnOcrPreview)
         consoleRow.addView(btnUserScript)
         consoleRow.addView(btnLogs)
         consoleRow.addView(btnStop)
+        consoleRow.addView(consoleText)
+        consoleScroll.addView(consoleRow)
 
         webContainer = FrameLayout(this).apply {
             layoutParams = LinearLayout.LayoutParams(
@@ -318,18 +312,113 @@ class MainActivity : Activity() {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 dp(110)
             )
-            text = "[System] Gemini Browser Log Ready...\n"
+            text = "[System] Gemini Browser Ready on port $SERVER_PORT...\n"
         }
 
         root.addView(navBar)
-        root.addView(consoleRow)
+        root.addView(consoleScroll)
         root.addView(webContainer)
         root.addView(logPanel)
 
         setContentView(root)
     }
 
-    // ==================== USERSCRIPT MANAGER (UI + ENGINE) ====================
+    // ==================== DOWNLOAD ENGINE (HTTP/HTTPS + BLOB + DATA URLs) ====================
+
+    private fun startBrowserDownload(
+        url: String,
+        userAgent: String?,
+        contentDisposition: String?,
+        mimeType: String?
+    ) {
+        try {
+            if (url.startsWith("blob:")) {
+                val safeBlobUrl = url.replace("'", "\\'")
+                val js = """
+                    (function() {
+                        fetch('$safeBlobUrl')
+                            .then(r => r.blob())
+                            .then(blob => {
+                                const reader = new FileReader();
+                                reader.onloadend = function() {
+                                    const b64 = (reader.result || '').split(',')[1] || '';
+                                    const ext = (blob.type && blob.type.split('/')[1]) ? '.' + blob.type.split('/')[1].split(';')[0] : '.bin';
+                                    const fname = 'gemini_download_' + Date.now() + ext;
+                                    if (window.AIAgentBridge && window.AIAgentBridge.saveBase64Download) {
+                                        window.AIAgentBridge.saveBase64Download(b64, fname, blob.type || 'application/octet-stream');
+                                    }
+                                };
+                                reader.readAsDataURL(blob);
+                            })
+                            .catch(e => console.error('Blob download error:', e));
+                    })();
+                """.trimIndent()
+                mainHandler.post { webView.evaluateJavascript(js, null) }
+                return
+            }
+
+            if (url.startsWith("data:")) {
+                val commaIdx = url.indexOf(',')
+                if (commaIdx != -1) {
+                    val meta = url.substring(5, commaIdx)
+                    val dataPart = url.substring(commaIdx + 1)
+                    val mime = meta.substringBefore(";").ifEmpty { "application/octet-stream" }
+                    val ext = MimeTypeMap.getSingleton().getExtensionFromMimeType(mime)?.let { ".$it" } ?: ".bin"
+                    val fileName = "gemini_data_${System.currentTimeMillis()}$ext"
+                    val bytes = if (meta.contains("base64", ignoreCase = true)) {
+                        Base64.decode(dataPart, Base64.DEFAULT)
+                    } else {
+                        Uri.decode(dataPart).toByteArray(Charsets.UTF_8)
+                    }
+                    saveBytesToDownloads(bytes, fileName)
+                }
+                return
+            }
+
+            val fileName = URLUtil.guessFileName(url, contentDisposition, mimeType)
+            val request = DownloadManager.Request(Uri.parse(url)).apply {
+                setMimeType(mimeType)
+                val cookies = CookieManager.getInstance().getCookie(url)
+                if (!cookies.isNullOrEmpty()) {
+                    addRequestHeader("Cookie", cookies)
+                }
+                addRequestHeader("User-Agent", userAgent ?: mobileUA)
+                setDescription("Downloading via Gemini Browser...")
+                setTitle(fileName)
+                setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
+            }
+
+            val dm = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+            dm.enqueue(request)
+            appendLog("📥 Downloading: $fileName")
+            setConsoleStatus("🟢 Downloading: $fileName", false)
+            Toast.makeText(this, "📥 Downloading: $fileName", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            appendLog("Download Error: ${e.message}")
+            Toast.makeText(this, "Download Failed: ${e.message}", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun saveBytesToDownloads(bytes: ByteArray, fileName: String) {
+        serverPool.execute {
+            try {
+                val dlDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                if (!dlDir.exists()) dlDir.mkdirs()
+                val outFile = File(dlDir, fileName)
+                FileOutputStream(outFile).use { it.write(bytes) }
+                appendLog("✅ Saved to Downloads: ${outFile.name} (${bytes.size} bytes)")
+                setConsoleStatus("🟢 Saved: ${outFile.name}", false)
+                mainHandler.post {
+                    Toast.makeText(this@MainActivity, "✅ Downloaded: ${outFile.name}", Toast.LENGTH_SHORT).show()
+                }
+            } catch (e: Exception) {
+                appendLog("Save Download Error: ${e.message}")
+            }
+        }
+    }
+
+    // ==================== USERSCRIPT MANAGER ====================
 
     private fun getSavedUserScripts(): JSONArray {
         val raw = prefs.getString("userscripts_list", "[]") ?: "[]"
@@ -357,16 +446,6 @@ class MainActivity : Activity() {
             setPadding(0, 0, 0, dp(8))
         }
         container.addView(titleTv)
-
-        if (scripts.length() > 0) {
-            val savedHeader = TextView(this).apply {
-                text = "Saved Scripts (${scripts.length()}):"
-                setTextColor(Color.LTGRAY)
-                textSize = 12f
-                setPadding(0, 0, 0, dp(4))
-            }
-            container.addView(savedHeader)
-        }
 
         var dialogRef: AlertDialog? = null
 
@@ -399,6 +478,7 @@ class MainActivity : Activity() {
                 textSize = 9f
                 setTextColor(Color.WHITE)
                 setBackgroundColor(if (sEnabled) Color.parseColor("#2E7D32") else Color.parseColor("#555555"))
+                minWidth = 0; minimumWidth = 0
                 setPadding(dp(6), dp(2), dp(6), dp(2))
                 layoutParams = LinearLayout.LayoutParams(dp(44), dp(28)).apply { marginEnd = dp(4) }
                 setOnClickListener {
@@ -414,6 +494,7 @@ class MainActivity : Activity() {
                 textSize = 9f
                 setTextColor(Color.WHITE)
                 setBackgroundColor(Color.parseColor("#1565C0"))
+                minWidth = 0; minimumWidth = 0
                 setPadding(dp(6), dp(2), dp(6), dp(2))
                 layoutParams = LinearLayout.LayoutParams(dp(48), dp(28)).apply { marginEnd = dp(4) }
                 setOnClickListener {
@@ -427,6 +508,7 @@ class MainActivity : Activity() {
                 textSize = 9f
                 setTextColor(Color.WHITE)
                 setBackgroundColor(Color.parseColor("#6A1B9A"))
+                minWidth = 0; minimumWidth = 0
                 setPadding(dp(6), dp(2), dp(6), dp(2))
                 layoutParams = LinearLayout.LayoutParams(dp(48), dp(28)).apply { marginEnd = dp(4) }
                 setOnClickListener {
@@ -440,6 +522,7 @@ class MainActivity : Activity() {
                 textSize = 9f
                 setTextColor(Color.WHITE)
                 setBackgroundColor(Color.parseColor("#C62828"))
+                minWidth = 0; minimumWidth = 0
                 setPadding(dp(4), dp(2), dp(4), dp(2))
                 layoutParams = LinearLayout.LayoutParams(dp(34), dp(28))
                 setOnClickListener {
@@ -479,7 +562,7 @@ class MainActivity : Activity() {
         }
 
         val codeInput = EditText(this).apply {
-            hint = "// Paste JavaScript or Tampermonkey UserScript here...\n// Optional: // @match https://example.com/*\nconsole.log('UserScript Active!');"
+            hint = "// Paste JavaScript or Tampermonkey UserScript here..."
             setHintTextColor(Color.GRAY)
             setTextColor(Color.parseColor("#80CBC4"))
             setBackgroundColor(Color.parseColor("#0D0D0D"))
@@ -532,9 +615,7 @@ class MainActivity : Activity() {
             setTextColor(Color.WHITE)
             setBackgroundColor(Color.parseColor("#455A64"))
             layoutParams = LinearLayout.LayoutParams(0, dp(34), 1f)
-            setOnClickListener {
-                codeInput.setText("")
-            }
+            setOnClickListener { codeInput.setText("") }
         }
 
         helperRow.addView(btnPasteClip)
@@ -558,7 +639,7 @@ class MainActivity : Activity() {
                 val jsCode = codeInput.text.toString()
                 if (jsCode.trim().isNotEmpty()) {
                     runSingleUserScriptOnPage(nameInput.text.toString().ifEmpty { "TempScript" }, jsCode)
-                    Toast.makeText(this@MainActivity, "Script Executed on Page!", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this@MainActivity, "Script Executed!", Toast.LENGTH_SHORT).show()
                     dialogRef?.dismiss()
                 }
             }
@@ -572,25 +653,14 @@ class MainActivity : Activity() {
             layoutParams = LinearLayout.LayoutParams(0, dp(38), 1f)
             setOnClickListener {
                 val jsCode = codeInput.text.toString().trim()
-                if (jsCode.isEmpty()) {
-                    Toast.makeText(this@MainActivity, "Code cannot be empty!", Toast.LENGTH_SHORT).show()
-                    return@setOnClickListener
-                }
+                if (jsCode.isEmpty()) return@setOnClickListener
                 var sName = nameInput.text.toString().trim()
                 if (sName.isEmpty()) {
                     val m = Regex("//\\s*@name\\s+(.+)").find(jsCode)
                     sName = m?.groupValues?.get(1)?.trim() ?: "UserScript #${scripts.length() + 1}"
                 }
-                val entry = JSONObject()
-                    .put("name", sName)
-                    .put("code", jsCode)
-                    .put("enabled", true)
-
-                if (editIndex in 0 until scripts.length()) {
-                    scripts.put(editIndex, entry)
-                } else {
-                    scripts.put(entry)
-                }
+                val entry = JSONObject().put("name", sName).put("code", jsCode).put("enabled", true)
+                if (editIndex in 0 until scripts.length()) scripts.put(editIndex, entry) else scripts.put(entry)
                 saveUserScripts(scripts)
                 runSingleUserScriptOnPage(sName, jsCode)
                 Toast.makeText(this@MainActivity, "Saved & Executed: $sName", Toast.LENGTH_SHORT).show()
@@ -640,27 +710,13 @@ class MainActivity : Activity() {
                             return s;
                         };
                     }
-                    if (typeof window.GM_setValue === 'undefined') {
-                        window.GM_setValue = function(k, v) { localStorage.setItem('GM_' + k, JSON.stringify(v)); };
-                    }
-                    if (typeof window.GM_getValue === 'undefined') {
-                        window.GM_getValue = function(k, defVal) {
-                            const v = localStorage.getItem('GM_' + k);
-                            return v !== null ? JSON.parse(v) : defVal;
-                        };
-                    }
-                    if (typeof window.GM_deleteValue === 'undefined') {
-                        window.GM_deleteValue = function(k) { localStorage.removeItem('GM_' + k); };
-                    }
                     const bin = atob('$b64');
                     const bytes = new Uint8Array(bin.length);
                     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
                     const decodedCode = new TextDecoder('utf-8').decode(bytes);
-                    const fn = new Function(decodedCode);
-                    fn();
-                    console.log('[AI UserScript Executed] $safeName');
+                    new Function(decodedCode)();
                 } catch (e) {
-                    console.error('[AI UserScript Error] $safeName:', e);
+                    console.error('[UserScript Error] $safeName:', e);
                 }
             })();
         """.trimIndent()
@@ -744,6 +800,7 @@ class MainActivity : Activity() {
             textSize = 11f
             setTextColor(Color.WHITE)
             setBackgroundColor(Color.parseColor("#333333"))
+            minWidth = 0; minimumWidth = 0
             setPadding(dp(6), dp(2), dp(6), dp(2))
             layoutParams = LinearLayout.LayoutParams(dp(40), dp(36)).apply {
                 marginEnd = dp(3)
@@ -786,13 +843,18 @@ class MainActivity : Activity() {
         CookieManager.getInstance().setAcceptCookie(true)
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
 
+        // Attach DownloadListener for all browser downloads
+        webView.setDownloadListener { url, userAgent, contentDisposition, mimetype, _ ->
+            startBrowserDownload(url, userAgent, contentDisposition, mimetype)
+        }
+
         webView.addJavascriptInterface(object {
             @JavascriptInterface
             fun onIdle(url: String) {
                 isNetworkIdle = true
                 broadcastSse("network_idle", url)
                 if (serverStarted.get()) {
-                    setConsoleStatus("🟢 ONLINE 127.0.0.1:8080 | AI: Idle", false)
+                    setConsoleStatus("🟢 ONLINE 127.0.0.1:$SERVER_PORT | AI: Idle", false)
                 }
             }
 
@@ -801,6 +863,16 @@ class MainActivity : Activity() {
                 appendLog("⚡ Auto-Clicked Latest Allow: $toolInfo")
                 setConsoleStatus("🟢 Auto-Allowed MCP Tool!", false)
                 broadcastSse("auto_allow_clicked", toolInfo)
+            }
+
+            @JavascriptInterface
+            fun saveBase64Download(base64Data: String, fileName: String, mimeType: String) {
+                try {
+                    val bytes = Base64.decode(base64Data, Base64.DEFAULT)
+                    saveBytesToDownloads(bytes, fileName)
+                } catch (e: Exception) {
+                    appendLog("Blob decode error: ${e.message}")
+                }
             }
         }, "AIAgentBridge")
 
@@ -817,7 +889,7 @@ class MainActivity : Activity() {
                 urlInput.setText(currentUrl)
                 injectStealthViewportAndTracker()
                 if (serverStarted.get()) {
-                    setConsoleStatus("🟢 127.0.0.1:8080 | Loading...", false)
+                    setConsoleStatus("🟢 127.0.0.1:$SERVER_PORT | Loading...", false)
                 }
             }
 
@@ -832,7 +904,7 @@ class MainActivity : Activity() {
                 injectSavedUserScripts(currentUrl)
                 broadcastSse("page_loaded", currentUrl)
                 if (serverStarted.get()) {
-                    setConsoleStatus("🟢 ONLINE 127.0.0.1:8080 | AI: Ready", false)
+                    setConsoleStatus("🟢 ONLINE 127.0.0.1:$SERVER_PORT | AI: Ready", false)
                 }
             }
         }
@@ -877,7 +949,6 @@ class MainActivity : Activity() {
         }
     }
 
-    // Google OAuth Stealth + Latest "Allow" Auto-Clicker + In-DOM <select> Modal
     private fun injectStealthViewportAndTracker() {
         val isPc = if (desktopMode) "true" else "false"
         val js = """
@@ -893,50 +964,51 @@ class MainActivity : Activity() {
                         { brand: 'Chromium', version: '126' },
                         { brand: 'Google Chrome', version: '126' }
                     ];
-                    if ($isPc) {
-                        Object.defineProperty(navigator, 'platform', { get: () => 'Linux x86_64', configurable: true });
-                        Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0, configurable: true });
-                        Object.defineProperty(navigator, 'userAgentData', {
-                            get: () => ({
+                    Object.defineProperty(navigator, 'userAgentData', {
+                        get: () => ({
+                            brands: brandsList,
+                            mobile: !$isPc,
+                            platform: $isPc ? 'Linux' : 'Android',
+                            getHighEntropyValues: async () => ({
+                                architecture: $isPc ? 'x86' : 'arm',
+                                bitness: '64',
                                 brands: brandsList,
-                                mobile: false,
-                                platform: 'Linux',
-                                getHighEntropyValues: async () => ({
-                                    architecture: 'x86',
-                                    bitness: '64',
-                                    brands: brandsList,
-                                    mobile: false,
-                                    model: '',
-                                    platform: 'Linux',
-                                    platformVersion: '6.5.0',
-                                    uaFullVersion: '126.0.6478.122'
-                                })
-                            }),
-                            configurable: true
-                        });
-                    } else {
-                        Object.defineProperty(navigator, 'userAgentData', {
-                            get: () => ({
-                                brands: brandsList,
-                                mobile: true,
-                                platform: 'Android',
-                                getHighEntropyValues: async () => ({
-                                    architecture: 'arm',
-                                    bitness: '64',
-                                    brands: brandsList,
-                                    mobile: true,
-                                    model: 'Pixel 8',
-                                    platform: 'Android',
-                                    platformVersion: '14.0.0',
-                                    uaFullVersion: '126.0.6478.122'
-                                })
-                            }),
-                            configurable: true
-                        });
-                    }
+                                mobile: !$isPc,
+                                model: $isPc ? '' : 'Pixel 8',
+                                platform: $isPc ? 'Linux' : 'Android',
+                                platformVersion: '14.0.0',
+                                uaFullVersion: '126.0.6478.122'
+                            })
+                        }),
+                        configurable: true
+                    });
                 } catch (e) {}
 
-                // 2. Auto-Click Newly Appeared Latest "Allow" Button (Gemini MCP Tool Confirmation)
+                // 2. Intercept <a download> blob links automatically
+                if (!window.__aiDownloadHooked) {
+                    window.__aiDownloadHooked = true;
+                    document.addEventListener('click', function(e) {
+                        const a = e.target && e.target.closest ? e.target.closest('a[download], a[href^="blob:"], a[href^="data:"]') : null;
+                        if (a && a.href && (a.href.startsWith('blob:') || a.href.startsWith('data:'))) {
+                            const fname = a.getAttribute('download') || ('gemini_file_' + Date.now());
+                            if (a.href.startsWith('blob:')) {
+                                e.preventDefault();
+                                fetch(a.href).then(r => r.blob()).then(blob => {
+                                    const reader = new FileReader();
+                                    reader.onloadend = function() {
+                                        const b64 = (reader.result || '').split(',')[1] || '';
+                                        if (window.AIAgentBridge && window.AIAgentBridge.saveBase64Download) {
+                                            window.AIAgentBridge.saveBase64Download(b64, fname, blob.type || 'application/octet-stream');
+                                        }
+                                    };
+                                    reader.readAsDataURL(blob);
+                                });
+                            }
+                        }
+                    }, true);
+                }
+
+                // 3. Auto-Click Newly Appeared Latest "Allow" Button (Gemini MCP Tool Confirmation)
                 if (!window.__geminiAllowClickerInstalled) {
                     window.__geminiAllowClickerInstalled = true;
 
@@ -962,21 +1034,17 @@ class MainActivity : Activity() {
                                 }
                                 const allNodes = root.querySelectorAll('*');
                                 for (let i = 0; i < allNodes.length; i++) {
-                                    if (allNodes[i].shadowRoot) {
-                                        collectButtons(allNodes[i].shadowRoot);
-                                    }
+                                    if (allNodes[i].shadowRoot) collectButtons(allNodes[i].shadowRoot);
                                 }
                             }
 
                             collectButtons(document);
 
                             if (candidates.length > 0) {
-                                // Pick the LAST (latest added) visible Allow button in DOM
                                 const latestBtn = candidates[candidates.length - 1];
                                 const now = Date.now();
                                 const lastClickedTime = parseInt(latestBtn.getAttribute('data-ai-allow-ts') || '0', 10);
 
-                                // Click immediately if never clicked, or retry if still open after 1200ms
                                 if (now - lastClickedTime > 1200) {
                                     latestBtn.setAttribute('data-ai-allow-ts', String(now));
                                     const evOpts = { bubbles: true, cancelable: true, composed: true, view: window };
@@ -994,81 +1062,12 @@ class MainActivity : Activity() {
                         } catch (err) {}
                     }
 
-                    const allowObs = new MutationObserver(function() {
-                        findAndClickLatestAllow();
-                    });
+                    const allowObs = new MutationObserver(function() { findAndClickLatestAllow(); });
                     if (document.documentElement) {
                         allowObs.observe(document.documentElement, { childList: true, subtree: true });
                     }
                     setInterval(findAndClickLatestAllow, 350);
                     findAndClickLatestAllow();
-                }
-
-                // 3. Smart In-DOM <select> Modal Builder
-                window.__aiOpenSelectModal = function(selectEl) {
-                    if (!selectEl || selectEl.tagName !== 'SELECT') return false;
-                    const existing = document.getElementById('__ai_select_modal');
-                    if (existing) existing.remove();
-
-                    const modal = document.createElement('div');
-                    modal.id = '__ai_select_modal';
-                    modal.style.cssText = 'position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(0,0,0,0.65);z-index:2147483647;display:flex;align-items:center;justify-content:center;padding:16px;box-sizing:border-box;font-family:sans-serif;';
-
-                    const card = document.createElement('div');
-                    card.style.cssText = 'background:#2b2b2b;color:#fff;width:100%;max-width:420px;max-height:82vh;border-radius:12px;overflow-y:auto;box-shadow:0 10px 30px rgba(0,0,0,0.8);border:1px solid #444;';
-
-                    for (let i = 0; i < selectEl.options.length; i++) {
-                        const opt = selectEl.options[i];
-                        const isSelected = (selectEl.selectedIndex === i);
-                        const item = document.createElement('div');
-                        item.setAttribute('role', 'option');
-                        item.setAttribute('data-ai-select-index', i);
-                        item.setAttribute('data-ai-option-value', opt.value || '');
-                        item.style.cssText = 'padding:14px 18px;border-bottom:1px solid #3d3d3d;display:flex;align-items:center;justify-content:space-between;cursor:pointer;font-size:15px;' + (isSelected ? 'background:#1e3a2f;color:#00e676;font-weight:bold;' : '');
-
-                        const spanTxt = document.createElement('span');
-                        spanTxt.textContent = (opt.text || opt.label || opt.value || '').trim();
-
-                        const radio = document.createElement('span');
-                        radio.textContent = isSelected ? '◉' : '○';
-                        radio.style.cssText = 'font-size:18px;margin-left:12px;color:' + (isSelected ? '#4dd0e1' : '#aaa') + ';';
-
-                        item.appendChild(spanTxt);
-                        item.appendChild(radio);
-
-                        item.addEventListener('click', function(ev) {
-                            ev.stopPropagation();
-                            selectEl.selectedIndex = i;
-                            selectEl.value = opt.value;
-                            selectEl.dispatchEvent(new Event('focus', { bubbles: true }));
-                            selectEl.dispatchEvent(new Event('input', { bubbles: true }));
-                            selectEl.dispatchEvent(new Event('change', { bubbles: true }));
-                            if (window.jQuery) {
-                                try { window.jQuery(selectEl).trigger('change'); } catch (e) {}
-                            }
-                            modal.remove();
-                        });
-                        card.appendChild(item);
-                    }
-
-                    modal.addEventListener('click', function(ev) {
-                        if (ev.target === modal) modal.remove();
-                    });
-                    modal.appendChild(card);
-                    document.body.appendChild(modal);
-                    return true;
-                };
-
-                if (!window.__aiSelectHooked) {
-                    window.__aiSelectHooked = true;
-                    document.addEventListener('mousedown', function(e) {
-                        const sel = e.target && e.target.closest ? e.target.closest('select') : null;
-                        if (sel && !sel.multiple) {
-                            e.preventDefault();
-                            e.stopPropagation();
-                            window.__aiOpenSelectModal(sel);
-                        }
-                    }, true);
                 }
 
                 if (window.__aiTrackerInstalled) return;
@@ -1120,24 +1119,22 @@ class MainActivity : Activity() {
 
     private fun ensureServerRunning() {
         if (serverStarted.get() && serverSocket != null && !serverSocket!!.isClosed) {
-            setConsoleStatus("🟢 ONLINE 127.0.0.1:8080 | AI: Ready", false)
+            setConsoleStatus("🟢 ONLINE 127.0.0.1:$SERVER_PORT | AI: Ready", false)
             return
         }
 
         serverPool.execute {
-            try {
-                serverSocket?.close()
-            } catch (_: Exception) {}
+            try { serverSocket?.close() } catch (_: Exception) {}
 
             try {
                 val sock = ServerSocket()
                 sock.reuseAddress = true
-                sock.bind(InetSocketAddress("0.0.0.0", 8080), 50)
+                sock.bind(InetSocketAddress("0.0.0.0", SERVER_PORT), 50)
                 serverSocket = sock
                 serverStarted.set(true)
 
-                setConsoleStatus("🟢 ONLINE 127.0.0.1:8080 | AI: Ready", false)
-                appendLog("Server listening on 0.0.0.0:8080 (Termux Ready)")
+                setConsoleStatus("🟢 ONLINE 127.0.0.1:$SERVER_PORT | AI: Ready", false)
+                appendLog("Server listening on 0.0.0.0:$SERVER_PORT (Termux Ready)")
 
                 while (serverStarted.get() && !sock.isClosed) {
                     val client = sock.accept()
@@ -1148,7 +1145,7 @@ class MainActivity : Activity() {
                 }
             } catch (e: Exception) {
                 serverStarted.set(false)
-                setConsoleStatus("🔴 SERVER ERROR 8080: ${e.message}", true)
+                setConsoleStatus("🔴 SERVER ERROR $SERVER_PORT: ${e.message}", true)
                 appendLog("Server error: ${e.message}")
             }
         }
@@ -1228,14 +1225,14 @@ class MainActivity : Activity() {
     private fun executeCommand(method: String, path: String, body: JSONObject?): String {
         isEmergencyStopped.set(false)
         appendLog("$method $path")
-        setConsoleStatus("🟢 127.0.0.1:8080 | CMD: $method $path", false)
+        setConsoleStatus("🟢 127.0.0.1:$SERVER_PORT | CMD: $method $path", false)
 
         return when (path) {
             "/", "/status" -> {
                 JSONObject()
                     .put("status", "online")
                     .put("browser", "Gemini Browser")
-                    .put("port", 8080)
+                    .put("port", SERVER_PORT)
                     .put("url", currentUrl)
                     .put("title", currentTitle)
                     .put("loading", isPageLoading)
@@ -1251,6 +1248,14 @@ class MainActivity : Activity() {
                 JSONObject().put("status", "ok").put("desktop_mode", desktopMode).toString()
             }
 
+            "/download" -> {
+                val dlUrl = body?.optString("url", currentUrl) ?: currentUrl
+                runOnMainSync {
+                    startBrowserDownload(dlUrl, if (desktopMode) desktopUA else mobileUA, null, null)
+                }
+                JSONObject().put("status", "download_started").put("url", dlUrl).toString()
+            }
+
             "/navigate" -> {
                 val targetUrl = body?.optString("url", "https://gemini.google.com") ?: "https://gemini.google.com"
                 val waitIdle = body?.optBoolean("wait_idle", true) ?: true
@@ -1260,9 +1265,7 @@ class MainActivity : Activity() {
                 }
                 isPageLoading = true
                 isNetworkIdle = false
-                runOnMainSync {
-                    webView.loadUrl(targetUrl)
-                }
+                runOnMainSync { webView.loadUrl(targetUrl) }
                 if (waitIdle) {
                     val start = System.currentTimeMillis()
                     while (System.currentTimeMillis() - start < 8000) {
@@ -1334,9 +1337,7 @@ class MainActivity : Activity() {
                 performHumanTypingSync(elId, text, clear, submit, instant)
             }
 
-            "/editor" -> {
-                performCodeEditorActionSync(body ?: JSONObject())
-            }
+            "/editor" -> performCodeEditorActionSync(body ?: JSONObject())
 
             "/key" -> {
                 val keyName = body?.optString("key", "Enter") ?: "Enter"
@@ -1358,9 +1359,7 @@ class MainActivity : Activity() {
                 performSelectSync(elId, value, text, index)
             }
 
-            "/userscript", "/eval" -> {
-                handleUserScriptApiSync(body ?: JSONObject())
-            }
+            "/userscript", "/eval" -> handleUserScriptApiSync(body ?: JSONObject())
 
             "/wait" -> {
                 val selector = body?.optString("selector", "") ?: ""
@@ -1370,18 +1369,10 @@ class MainActivity : Activity() {
 
             "/upload" -> {
                 queuedFilePath = body?.optString("file_path", null)
-                JSONObject()
-                    .put("status", "queued")
-                    .put("file_path", queuedFilePath)
-                    .toString()
+                JSONObject().put("status", "queued").put("file_path", queuedFilePath).toString()
             }
 
-            else -> {
-                JSONObject()
-                    .put("status", "error")
-                    .put("message", "Unknown endpoint: $path")
-                    .toString()
-            }
+            else -> JSONObject().put("status", "error").put("message", "Unknown endpoint: $path").toString()
         }
     }
 
@@ -1396,13 +1387,10 @@ class MainActivity : Activity() {
         val name = body.optString("name", "API_UserScript")
 
         return when (action) {
-            "list" -> {
-                JSONObject().put("status", "ok").put("scripts", getSavedUserScripts()).toString()
-            }
+            "list" -> JSONObject().put("status", "ok").put("scripts", getSavedUserScripts()).toString()
             "add", "save" -> {
                 val arr = getSavedUserScripts()
-                val obj = JSONObject().put("name", name).put("code", code).put("enabled", true)
-                arr.put(obj)
+                arr.put(JSONObject().put("name", name).put("code", code).put("enabled", true))
                 saveUserScripts(arr)
                 runSingleUserScriptOnPage(name, code)
                 JSONObject().put("status", "saved_and_executed").put("name", name).put("total_scripts", arr.length()).toString()
@@ -1423,7 +1411,7 @@ class MainActivity : Activity() {
         val overlayW = overlayView.width.coerceAtLeast(1)
         val js = """
             (function() {
-                const selectors = 'a, button, input, select, textarea, [role="button"], [role="option"], [role="menuitem"], [role="textbox"], [role="code"], [contenteditable="true"], .monaco-editor, .cm-content, .ace_editor, [onclick], summary';
+                const selectors = 'a, button, input, select, textarea, [role="button"], [role="option"], [role="menuitem"], [role="textbox"], [contenteditable="true"], .monaco-editor, .cm-content';
                 const nodes = document.querySelectorAll(selectors);
                 const scale = $overlayW / (window.innerWidth || 1);
                 const list = [];
@@ -1440,33 +1428,12 @@ class MainActivity : Activity() {
                         const id = idCounter++;
                         el.setAttribute('data-ai-id', id);
                         const tag = el.tagName.toLowerCase();
-                        const isEditor = el.classList.contains('monaco-editor') || el.classList.contains('cm-content') || el.getAttribute('contenteditable') === 'true';
+                        const rawLabel = (el.innerText || el.value || el.placeholder || el.getAttribute('aria-label') || el.name || '').replace(/\s+/g, ' ').trim();
 
-                        let rawLabel = '';
-                        let optionsPreview = null;
-
-                        if (tag === 'select') {
-                            const selOpt = el.options && el.selectedIndex >= 0 ? el.options[el.selectedIndex] : null;
-                            rawLabel = selOpt ? (selOpt.text || selOpt.value || '') : '';
-                            const opts = [];
-                            if (el.options) {
-                                for (let i = 0; i < Math.min(el.options.length, 25); i++) {
-                                    opts.push((el.options[i].text || el.options[i].value || '').trim());
-                                }
-                            }
-                            optionsPreview = opts;
-                        } else {
-                            rawLabel = (el.innerText || el.value || el.placeholder || el.getAttribute('aria-label') || el.name || (isEditor ? 'Code Editor' : '')).replace(/\s+/g, ' ').trim();
-                            if (rawLabel.length <= 4 && el.parentElement) {
-                                const rowText = (el.parentElement.innerText || '').replace(/\s+/g, ' ').trim();
-                                if (rowText.length > rawLabel.length) rawLabel = rowText;
-                            }
-                        }
-
-                        const itemObj = {
+                        list.push({
                             id: id,
-                            tag: isEditor ? 'code-editor' : (el.getAttribute('role') === 'option' ? 'dropdown-option' : tag),
-                            type: el.type || (tag === 'select' ? 'dropdown' : (isEditor ? 'monaco/codemirror' : '')),
+                            tag: tag,
+                            type: el.type || '',
                             text: rawLabel.slice(0, 140),
                             x: Math.round((r.left + r.width / 2) * scale),
                             y: Math.round((r.top + r.height / 2) * scale),
@@ -1476,9 +1443,7 @@ class MainActivity : Activity() {
                             bottom: Math.round(r.bottom * scale),
                             width: Math.round(r.width * scale),
                             height: Math.round(r.height * scale)
-                        };
-                        if (optionsPreview) itemObj.options = optionsPreview;
-                        list.push(itemObj);
+                        });
                     }
                 });
                 return JSON.stringify(list);
@@ -1500,9 +1465,7 @@ class MainActivity : Activity() {
                     )
                     boxes.add(Pair(rect, "[${o.getInt("id")}]"))
                 }
-                runOnMainSync {
-                    overlayView.showDomBoxes(boxes)
-                }
+                runOnMainSync { overlayView.showDomBoxes(boxes) }
             } catch (_: Exception) {}
         }
         return if (jsonStr.isNotEmpty()) jsonStr else "[]"
@@ -1518,26 +1481,7 @@ class MainActivity : Activity() {
             val textClickRes = evalJsSync("""
                 (function() {
                     const q = '$safeTarget'.trim().toLowerCase();
-                    const selects = document.querySelectorAll('select');
-                    for (let s = 0; s < selects.length; s++) {
-                        const sel = selects[s];
-                        for (let i = 0; i < sel.options.length; i++) {
-                            const opt = sel.options[i];
-                            const txt = (opt.text || opt.label || opt.value || '').trim().toLowerCase();
-                            if (txt === q || txt.includes(q)) {
-                                sel.selectedIndex = i;
-                                sel.value = opt.value;
-                                sel.dispatchEvent(new Event('focus', { bubbles: true }));
-                                sel.dispatchEvent(new Event('input', { bubbles: true }));
-                                sel.dispatchEvent(new Event('change', { bubbles: true }));
-                                if (window.jQuery) { try { window.jQuery(sel).trigger('change'); } catch(e){} }
-                                const modal = document.getElementById('__ai_select_modal');
-                                if (modal) modal.remove();
-                                return JSON.stringify({ status: 'selected_option', option_text: opt.text, index: i, value: opt.value });
-                            }
-                        }
-                    }
-                    const nodes = document.querySelectorAll('[role="option"], [role="menuitem"], li, button, a, label, span, div');
+                    const nodes = document.querySelectorAll('[role="option"], [role="menuitem"], button, a, [role="button"], span, div');
                     for (let i = nodes.length - 1; i >= 0; i--) {
                         const el = nodes[i];
                         const t = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
@@ -1550,9 +1494,7 @@ class MainActivity : Activity() {
                     return '';
                 })();
             """.trimIndent())
-            if (textClickRes.startsWith("{")) {
-                return textClickRes
-            }
+            if (textClickRes.startsWith("{")) return textClickRes
         }
 
         var screenX = rawX
@@ -1560,36 +1502,6 @@ class MainActivity : Activity() {
         var targetRect: RectF? = null
 
         if (elementId > 0) {
-            val specialCheck = evalJsSync("""
-                (function() {
-                    const el = document.querySelector('[data-ai-id="$elementId"]');
-                    if (!el) return '';
-                    if (el.getAttribute('role') === 'option' && el.hasAttribute('data-ai-select-index')) {
-                        const txt = (el.innerText || '').trim();
-                        el.click();
-                        return JSON.stringify({ status: 'selected_dropdown_option', element_id: $elementId, selected_text: txt });
-                    }
-                    if (el.tagName.toLowerCase() === 'select') {
-                        if (window.__aiOpenSelectModal) window.__aiOpenSelectModal(el);
-                        const opts = [];
-                        for (let i = 0; i < el.options.length; i++) {
-                            opts.push({ index: i, text: (el.options[i].text || '').trim(), value: el.options[i].value });
-                        }
-                        return JSON.stringify({
-                            status: 'select_dropdown_opened',
-                            element_id: $elementId,
-                            options: opts
-                        });
-                    }
-                    return '';
-                })();
-            """.trimIndent())
-
-            if (specialCheck.startsWith("{")) {
-                extractDomSync(true)
-                return specialCheck
-            }
-
             val js = """
                 (function() {
                     const el = document.querySelector('[data-ai-id="$elementId"]');
@@ -1608,7 +1520,7 @@ class MainActivity : Activity() {
                 })();
             """.trimIndent()
             val posStr = evalJsSync(js)
-            Thread.sleep(200)
+            Thread.sleep(150)
             if (posStr.isNotEmpty() && posStr != "null") {
                 val obj = JSONObject(posStr)
                 screenX = obj.getDouble("x").toFloat()
@@ -1626,8 +1538,8 @@ class MainActivity : Activity() {
 
         val wvTouchX = screenX * wvScaleRatio
         val wvTouchY = screenY * wvScaleRatio
-
         val holdMs = (55..110).random().toLong()
+
         runOnMainSync {
             overlayView.showActionHighlight(screenX, screenY, targetRect, if (elementId > 0) "CLICK [$elementId]" else "TAP")
             val downTime = SystemClock.uptimeMillis()
@@ -1640,145 +1552,71 @@ class MainActivity : Activity() {
         }
 
         if (elementId > 0) {
-            evalJsSync("""
-                (function() {
-                    const el = document.querySelector('[data-ai-id="$elementId"]');
-                    if (!el) return;
-                    if (el.classList.contains('monaco-editor')) {
-                        const ta = el.querySelector('textarea.inputarea') || el.querySelector('textarea');
-                        if (ta) ta.focus(); else el.focus();
-                    } else {
-                        el.focus();
-                    }
-                })();
-            """.trimIndent())
+            evalJsSync("(function(){ const el = document.querySelector('[data-ai-id=\"$elementId\"]'); if (el) el.focus(); })()")
         }
 
         Thread.sleep(holdMs)
-        return JSONObject()
-            .put("status", "clicked")
-            .put("element_id", elementId)
-            .put("x", screenX)
-            .put("y", screenY)
-            .toString()
+        return JSONObject().put("status", "clicked").put("element_id", elementId).put("x", screenX).put("y", screenY).toString()
     }
 
     private fun performSelectSync(elementId: Int, value: String, text: String, index: Int): String {
         val safeVal = value.replace("\\", "\\\\").replace("'", "\\'")
         val safeTxt = text.replace("\\", "\\\\").replace("'", "\\'")
-        val res = evalJsSync("""
+        return evalJsSync("""
             (function() {
-                let el = $elementId > 0 ? document.querySelector('[data-ai-id="$elementId"]') : null;
-                if (!el || el.tagName.toLowerCase() !== 'select') {
-                    const allSelects = document.querySelectorAll('select');
-                    if (allSelects.length > 0) el = allSelects[0];
-                }
-                if (!el) return JSON.stringify({ status: 'error', message: 'Select element not found' });
-
-                if (el.tagName.toLowerCase() === 'select') {
-                    let chosenIdx = -1;
-                    if ($index >= 0 && $index < el.options.length) {
-                        chosenIdx = $index;
-                    } else {
-                        const qVal = '$safeVal'.trim().toLowerCase();
-                        const qTxt = '$safeTxt'.trim().toLowerCase();
-                        for (let i = 0; i < el.options.length; i++) {
-                            const ov = (el.options[i].value || '').trim().toLowerCase();
-                            const ot = (el.options[i].text || el.options[i].label || '').trim().toLowerCase();
-                            if ((qVal && (ov === qVal || ot === qVal)) || (qTxt && (ot === qTxt || ov === qTxt)) || (qTxt && ot.includes(qTxt))) {
-                                chosenIdx = i;
-                                break;
-                            }
-                        }
+                let el = $elementId > 0 ? document.querySelector('[data-ai-id="$elementId"]') : document.querySelector('select');
+                if (!el || el.tagName.toLowerCase() !== 'select') return JSON.stringify({ status: 'error', message: 'Select element not found' });
+                let chosenIdx = $index;
+                if (chosenIdx < 0) {
+                    const q = ('$safeTxt' || '$safeVal').trim().toLowerCase();
+                    for (let i = 0; i < el.options.length; i++) {
+                        const ot = (el.options[i].text || el.options[i].value || '').trim().toLowerCase();
+                        if (ot === q || ot.includes(q)) { chosenIdx = i; break; }
                     }
-
-                    if (chosenIdx >= 0) {
-                        const opt = el.options[chosenIdx];
-                        el.selectedIndex = chosenIdx;
-                        el.value = opt.value;
-                        el.dispatchEvent(new Event('change', { bubbles: true }));
-                        const modal = document.getElementById('__ai_select_modal');
-                        if (modal) modal.remove();
-                        return JSON.stringify({
-                            status: 'selected',
-                            selected_index: chosenIdx,
-                            selected_value: opt.value,
-                            selected_text: (opt.text || '').trim()
-                        });
-                    }
-                    return JSON.stringify({ status: 'option_not_found' });
                 }
-                el.click();
-                return JSON.stringify({ status: 'clicked' });
+                if (chosenIdx >= 0 && chosenIdx < el.options.length) {
+                    el.selectedIndex = chosenIdx;
+                    el.value = el.options[chosenIdx].value;
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    return JSON.stringify({ status: 'selected', selected_index: chosenIdx, selected_text: el.options[chosenIdx].text });
+                }
+                return JSON.stringify({ status: 'option_not_found' });
             })();
         """.trimIndent())
-        return if (res.startsWith("{")) res else JSONObject().put("status", res).put("element_id", elementId).toString()
     }
 
     private fun performHumanTypingSync(elementId: Int, text: String, clear: Boolean, submit: Boolean, instant: Boolean): String {
         if (elementId > 0) {
             performSmartClickSync(elementId, -1f, -1f)
-            Thread.sleep(160)
+            Thread.sleep(150)
         }
-
-        if (clear) {
-            performCodeEditorActionSync(JSONObject().put("action", "clear"))
-        }
-
-        if (instant) {
-            return performCodeEditorActionSync(JSONObject().put("action", "insert").put("text", text))
-        }
+        if (clear) performCodeEditorActionSync(JSONObject().put("action", "clear"))
+        if (instant) return performCodeEditorActionSync(JSONObject().put("action", "insert").put("text", text))
 
         for (i in 0 until text.length) {
-            if (isEmergencyStopped.get()) {
-                return JSONObject().put("status", "stopped").toString()
-            }
-            val ch = text[i]
-            val safe = ch.toString()
-                .replace("\\", "\\\\")
-                .replace("'", "\\'")
-                .replace("\n", "\\n")
-                .replace("\r", "")
-
-            val js = """
+            if (isEmergencyStopped.get()) return JSONObject().put("status", "stopped").toString()
+            val safe = text[i].toString().replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n").replace("\r", "")
+            evalJsSync("""
                 (function() {
                     let el = document.activeElement;
                     if (!el || el === document.body) {
-                        el = document.querySelector('.cm-content[contenteditable="true"], .monaco-editor textarea.inputarea, [contenteditable="true"], input:focus, textarea:focus');
+                        el = document.querySelector('[contenteditable="true"], input:focus, textarea:focus');
                         if (el) el.focus();
                     }
-                    if (!el) return 'no_element';
-
-                    el.dispatchEvent(new KeyboardEvent('keydown', { key: '$safe', bubbles: true, cancelable: true }));
-
-                    if (el.isContentEditable || el.getAttribute('contenteditable') === 'true' || el.classList.contains('inputarea')) {
+                    if (!el) return;
+                    if (el.isContentEditable || el.getAttribute('contenteditable') === 'true') {
                         document.execCommand('insertText', false, '$safe');
                     } else if ('value' in el) {
-                        const proto = el.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
-                        const desc = Object.getOwnPropertyDescriptor(proto, 'value');
-                        const nextVal = (el.value || '') + '$safe';
-                        if (desc && desc.set) desc.set.call(el, nextVal);
-                        else el.value = nextVal;
-                        el.dispatchEvent(new InputEvent('input', { data: '$safe', inputType: 'insertText', bubbles: true }));
+                        el.value = (el.value || '') + '$safe';
+                        el.dispatchEvent(new InputEvent('input', { data: '$safe', bubbles: true }));
                     }
-                    el.dispatchEvent(new KeyboardEvent('keyup', { key: '$safe', bubbles: true }));
-                    return 'ok';
                 })();
-            """.trimIndent()
-            evalJsSync(js)
-            Thread.sleep((35..95).random().toLong())
+            """.trimIndent())
+            Thread.sleep((30..80).random().toLong())
         }
 
-        if (submit) {
-            performSpecialKeySync("Enter")
-            evalJsSync("(function(){ const el = document.activeElement; if (el && el.form) el.form.submit(); })()")
-        }
-
-        return JSONObject()
-            .put("status", "typed")
-            .put("length", text.length)
-            .put("submitted", submit)
-            .toString()
+        if (submit) performSpecialKeySync("Enter")
+        return JSONObject().put("status", "typed").put("length", text.length).put("submitted", submit).toString()
     }
 
     private fun performCodeEditorActionSync(body: JSONObject): String {
@@ -1791,29 +1629,21 @@ class MainActivity : Activity() {
         }
         val b64Text = Base64.encodeToString(text.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
 
-        val js = """
+        return evalJsSync("""
             (function() {
                 const action = '$action';
-                function decodeB64Utf8(b64) {
-                    if (!b64) return '';
-                    try {
-                        const bin = atob(b64);
-                        const bytes = new Uint8Array(bin.length);
-                        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-                        return new TextDecoder('utf-8').decode(bytes);
-                    } catch (e) { return ''; }
-                }
-                const rawText = decodeB64Utf8('$b64Text');
+                const bin = atob('$b64Text');
+                const bytes = new Uint8Array(bin.length);
+                for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                const rawText = new TextDecoder('utf-8').decode(bytes);
                 let target = document.activeElement;
                 if (!target || target === document.body) {
-                    target = document.querySelector('.cm-content[contenteditable="true"], [contenteditable="true"], textarea, input');
+                    target = document.querySelector('[contenteditable="true"], textarea, input');
                     if (target) target.focus();
                 }
                 if (!target) return JSON.stringify({ status: 'no_target' });
-
                 if (action === 'clear') {
-                    if (target.isContentEditable) target.innerText = '';
-                    else target.value = '';
+                    if (target.isContentEditable) target.innerText = ''; else target.value = '';
                     target.dispatchEvent(new Event('input', { bubbles: true }));
                     return JSON.stringify({ status: 'cleared' });
                 }
@@ -1829,8 +1659,7 @@ class MainActivity : Activity() {
                 }
                 return JSON.stringify({ status: 'ok', content: (target.value || target.innerText || '') });
             })();
-        """.trimIndent()
-        return evalJsSync(js)
+        """.trimIndent())
     }
 
     private fun performSpecialKeySync(keyName: String): String {
@@ -1840,10 +1669,6 @@ class MainActivity : Activity() {
             "enter" -> KeyEvent.KEYCODE_ENTER
             "tab" -> KeyEvent.KEYCODE_TAB
             "escape", "esc" -> KeyEvent.KEYCODE_ESCAPE
-            "up", "arrowup" -> KeyEvent.KEYCODE_DPAD_UP
-            "down", "arrowdown" -> KeyEvent.KEYCODE_DPAD_DOWN
-            "left", "arrowleft" -> KeyEvent.KEYCODE_DPAD_LEFT
-            "right", "arrowright" -> KeyEvent.KEYCODE_DPAD_RIGHT
             else -> KeyEvent.KEYCODE_ENTER
         }
         runOnMainSync {
@@ -1870,9 +1695,7 @@ class MainActivity : Activity() {
         while (System.currentTimeMillis() - start < timeoutMs) {
             if (isEmergencyStopped.get()) break
             val found = evalJsSync("(function(){ return document.querySelector('$safeSel') !== null ? 'true' : 'false'; })()")
-            if (found == "true") {
-                return JSONObject().put("status", "found").put("selector", selector).toString()
-            }
+            if (found == "true") return JSONObject().put("status", "found").put("selector", selector).toString()
             Thread.sleep(250)
         }
         return JSONObject().put("status", "timeout").put("selector", selector).toString()
@@ -1937,43 +1760,31 @@ class MainActivity : Activity() {
                                     val top = (r.top / ocrScale).toInt()
                                     val right = (r.right / ocrScale).toInt()
                                     val bottom = (r.bottom / ocrScale).toInt()
-                                    val cx = (left + right) / 2
-                                    val cy = (top + bottom) / 2
                                     val id = blockId++
-
                                     ocrBlocksArray.put(
                                         JSONObject()
                                             .put("id", id)
                                             .put("text", txt)
-                                            .put("x", cx)
-                                            .put("y", cy)
+                                            .put("x", (left + right) / 2)
+                                            .put("y", (top + bottom) / 2)
                                             .put("left", left)
                                             .put("top", top)
                                             .put("right", right)
                                             .put("bottom", bottom)
                                     )
-                                    overlayBoxes.add(
-                                        Pair(
-                                            RectF(left.toFloat(), top.toFloat(), right.toFloat(), bottom.toFloat()),
-                                            "T$id"
-                                        )
-                                    )
+                                    overlayBoxes.add(Pair(RectF(left.toFloat(), top.toFloat(), right.toFloat(), bottom.toFloat()), "T$id"))
                                 }
                             }
                         }
                         latch.countDown()
                     }
-                    .addOnFailureListener {
-                        latch.countDown()
-                    }
+                    .addOnFailureListener { latch.countDown() }
                 latch.await(8, TimeUnit.SECONDS)
             } catch (_: Exception) {}
         }
 
         if (showBoxes && overlayBoxes.isNotEmpty()) {
-            runOnMainSync {
-                overlayView.showDomBoxes(overlayBoxes)
-            }
+            runOnMainSync { overlayView.showDomBoxes(overlayBoxes) }
         }
 
         return JSONObject()
