@@ -26,10 +26,13 @@ import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.*
+import java.net.HttpURLConnection
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.URL
 import java.net.URLDecoder
+import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.*
@@ -136,10 +139,10 @@ class MainActivity : Activity() {
         ).toInt()
     }
 
-    private fun makePanelButton(label: String, bgHex: String, widthDp: Int = 82, onClick: () -> Unit): Button {
+    private fun makePanelButton(label: String, bgHex: String, widthDp: Int = 78, onClick: () -> Unit): Button {
         return Button(this).apply {
             text = label
-            textSize = 10.5f
+            textSize = 10f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.WHITE)
             setBackgroundColor(Color.parseColor(bgHex))
@@ -147,7 +150,7 @@ class MainActivity : Activity() {
             minimumWidth = 0
             minHeight = 0
             minimumHeight = 0
-            setPadding(dp(8), dp(2), dp(8), dp(2))
+            setPadding(dp(6), dp(2), dp(6), dp(2))
             layoutParams = LinearLayout.LayoutParams(dp(widthDp), dp(30)).apply {
                 marginEnd = dp(5)
             }
@@ -282,6 +285,22 @@ class MainActivity : Activity() {
             }
         }
 
+        val btnVerify = makePanelButton("VERIFY", "#E65100") {
+            serverPool.execute {
+                setConsoleStatus("🟡 Verifying GitHub State...", false)
+                val vStr = performGitHubVerificationSync(null)
+                try {
+                    val vObj = JSONObject(vStr)
+                    val sha = vObj.optString("commit_sha", "").take(7)
+                    val path = vObj.optString("file_path", "")
+                    val runSt = vObj.optString("actions_run_status", "")
+                    val summary = "SHA:${sha.ifEmpty { "N/A" }} | Path:${path.ifEmpty { "N/A" }} | Run:${runSt.ifEmpty { "N/A" }}"
+                    setConsoleStatus("🟢 $summary", false)
+                    appendLog("VERIFY -> $summary")
+                } catch (_: Exception) {}
+            }
+        }
+
         val btnUserScript = makePanelButton("JS", "#6A1B9A") {
             showUserScriptDialog()
         }
@@ -290,7 +309,7 @@ class MainActivity : Activity() {
             logPanel.visibility = if (logPanel.visibility == View.VISIBLE) View.GONE else View.VISIBLE
         }
 
-        val btnStop = makePanelButton("STOP", "#D50000", 86) {
+        val btnStop = makePanelButton("STOP", "#D50000", 82) {
             isEmergencyStopped.set(true)
             webView.stopLoading()
             overlayView.clearHighlights()
@@ -315,6 +334,7 @@ class MainActivity : Activity() {
 
         consoleRow.addView(btnDomPreview)
         consoleRow.addView(btnOcrPreview)
+        consoleRow.addView(btnVerify)
         consoleRow.addView(btnUserScript)
         consoleRow.addView(btnLogs)
         consoleRow.addView(btnStop)
@@ -376,6 +396,235 @@ class MainActivity : Activity() {
         root.addView(logPanel)
 
         setContentView(root)
+    }
+
+    // ==================== STEP 6: ACTUAL GITHUB COMMIT & ACTIONS VERIFIER ====================
+
+    private fun performGitHubVerificationSync(body: JSONObject?): String {
+        val expectedPath = body?.optString("expected_path", body.optString("path", "")) ?: ""
+        val expectedText = body?.optString("expected_content", body.optString("contains", "")) ?: ""
+        val repoParam = body?.optString("repo", "") ?: ""
+        val tokenParam = body?.optString("token", "") ?: ""
+
+        // 1. Deep DOM Verification on Current Browser Page (Commit SHA, File Path, File Content, Actions Run & Logs)
+        val domVerifyJs = """
+            (function() {
+                const url = window.location.href || '';
+                const pathName = window.location.pathname || '';
+
+                // Detect if still stuck in uncommitted editor mode
+                const isEditorOpen = /\/(edit|new)\//.test(pathName) ||
+                    document.querySelector('.cm-content[contenteditable="true"], .monaco-editor textarea.inputarea') !== null;
+
+                // Extract Commit SHA from URL, meta tags, or commit links
+                let commitSha = '';
+                const urlShaMatch = pathName.match(/\/(?:commit|blob|tree)\/([0-9a-f]{7,40})/i);
+                if (urlShaMatch) commitSha = urlShaMatch[1];
+
+                if (!commitSha) {
+                    const shaEl = document.querySelector(
+                        'a.commit-tease-sha, [data-testid="latest-commit-html"] a[href*="/commit/"], a[href*="/commit/"].Link--secondary, span.sha.user-select-contain, clipboard-copy[aria-label*="commit" i], meta[name="octolytics-dimension-repository_network_root_sha"]'
+                    );
+                    if (shaEl) {
+                        const href = shaEl.getAttribute('href') || '';
+                        const m = href.match(/\/commit\/([0-9a-f]{7,40})/i);
+                        commitSha = m ? m[1] : (shaEl.getAttribute('value') || shaEl.getAttribute('content') || shaEl.innerText || '').trim();
+                    }
+                }
+
+                // Extract Committed File Path from URL or Breadcrumbs
+                let filePath = '';
+                const blobMatch = pathName.match(/^\/[^\/]+\/[^\/]+\/(?:blob|edit|raw)\/[^\/]+\/(.+)$/);
+                if (blobMatch) {
+                    filePath = decodeURIComponent(blobMatch[1]);
+                } else {
+                    const crumbs = document.querySelectorAll('[data-testid="breadcrumbs"] a, .final-path, .js-path-segment a');
+                    if (crumbs.length > 0) {
+                        const parts = [];
+                        crumbs.forEach(c => {
+                            const t = (c.innerText || '').trim();
+                            if (t) parts.push(t);
+                        });
+                        filePath = parts.join('/');
+                    }
+                }
+
+                // Extract Committed File Content (Read-Only Blob View)
+                let committedLines = [];
+                const reactLines = document.querySelectorAll('.react-code-text, .blob-code-inner, [data-testid="read-only-cursor-text-area"]');
+                if (reactLines.length === 1 && reactLines[0].tagName === 'TEXTAREA') {
+                    committedLines = (reactLines[0].value || '').split('\n');
+                } else if (reactLines.length > 0) {
+                    reactLines.forEach(l => committedLines.push(l.innerText || l.textContent || ''));
+                }
+                const committedContent = committedLines.join('\n');
+
+                // Extract GitHub Actions Workflow Run Status, Steps & Error Logs
+                let actionsRunStatus = '';
+                let actionsConclusion = '';
+                const statusBadge = document.querySelector('[data-testid="status-badge"], .State, [aria-label*="workflow run" i]');
+                if (statusBadge) {
+                    actionsRunStatus = (statusBadge.innerText || statusBadge.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+                }
+
+                const stepSummaries = [];
+                const failedSteps = [];
+                document.querySelectorAll('.CheckStep, [data-testid="check-step"], details[data-conclusion]').forEach(step => {
+                    const conclusion = step.getAttribute('data-conclusion') || '';
+                    const nameEl = step.querySelector('.CheckStep-header-title, summary, span');
+                    const stepName = nameEl ? (nameEl.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 100) : 'step';
+                    if (conclusion || stepName) {
+                        stepSummaries.push({ name: stepName, conclusion: conclusion });
+                        if (conclusion === 'failure' || /fail|error/i.test(conclusion)) {
+                            failedSteps.push(stepName);
+                        }
+                    }
+                });
+
+                const actionLogs = [];
+                const errRegex = /(error:|exception|failed|failure|fatal|incompatible types|cannot find symbol|unresolved reference|execution failed for task|exit code [1-9])/i;
+                document.querySelectorAll('.CheckStep-line, .CheckAnnotation, .js-check-step-line, [data-testid="log-line"], pre code').forEach(lineEl => {
+                    const txt = (lineEl.innerText || '').replace(/\s+/g, ' ').trim();
+                    if (txt && (errRegex.test(txt) || actionLogs.length < 40)) {
+                        actionLogs.push(txt.slice(0, 350));
+                    }
+                });
+
+                // Flash banner or commit error alert check
+                let githubErrorBanner = '';
+                const flashErr = document.querySelector('.flash-error, [role="alert"].flash-error, .js-flash-alert');
+                if (flashErr) {
+                    githubErrorBanner = (flashErr.innerText || '').replace(/\s+/g, ' ').trim();
+                }
+
+                return JSON.stringify({
+                    url: url,
+                    is_still_in_editor: isEditorOpen,
+                    commit_sha: commitSha,
+                    file_path: filePath,
+                    committed_lines_count: committedLines.length,
+                    committed_content_length: committedContent.length,
+                    committed_content_preview: committedContent.slice(0, 500),
+                    committed_content_full: committedContent.slice(0, 15000),
+                    github_error_banner: githubErrorBanner,
+                    actions_run_status: actionsRunStatus,
+                    actions_steps: stepSummaries.slice(0, 30),
+                    actions_failed_steps: failedSteps,
+                    actions_logs: actionLogs.slice(0, 60)
+                });
+            })();
+        """.trimIndent()
+
+        val rawDomJson = evalJsSync(domVerifyJs)
+        val resultObj = try {
+            if (rawDomJson.startsWith("{")) JSONObject(rawDomJson) else JSONObject()
+        } catch (_: Exception) {
+            JSONObject()
+        }
+
+        val domPath = resultObj.optString("file_path", "")
+        val domContent = resultObj.optString("committed_content_full", "")
+        val isEditor = resultObj.optBoolean("is_still_in_editor", false)
+        val domSha = resultObj.optString("commit_sha", "")
+
+        var verified = !isEditor && (domSha.isNotEmpty() || domContent.isNotEmpty())
+        if (expectedPath.isNotEmpty() && !domPath.endsWith(expectedPath, ignoreCase = true)) {
+            verified = false
+        }
+        if (expectedText.isNotEmpty() && !domContent.contains(expectedText)) {
+            verified = false
+        }
+
+        resultObj.remove("committed_content_full")
+        resultObj.put("status", if (verified) "verified_success" else "unverified_or_pending")
+        resultObj.put("commit_verified", verified)
+
+        // 2. Optional Direct GitHub REST API Verification if "repo" is passed in /verify request
+        if (repoParam.isNotEmpty() && repoParam.contains("/")) {
+            try {
+                val apiVerification = verifyViaGitHubRestApi(repoParam, expectedPath, expectedText, tokenParam)
+                resultObj.put("github_api_verification", apiVerification)
+            } catch (e: Exception) {
+                resultObj.put("github_api_error", e.message ?: "API error")
+            }
+        }
+
+        return resultObj.toString()
+    }
+
+    private fun verifyViaGitHubRestApi(repo: String, path: String, expectedSubstring: String, token: String): JSONObject {
+        val out = JSONObject()
+        fun getJson(apiUrl: String): String {
+            val conn = URL(apiUrl).openConnection() as HttpURLConnection
+            conn.connectTimeout = 10000
+            conn.readTimeout = 10000
+            conn.setRequestProperty("User-Agent", "Gemini-Browser-Verifier")
+            conn.setRequestProperty("Accept", "application/vnd.github+json")
+            if (token.isNotEmpty()) {
+                conn.setRequestProperty("Authorization", "Bearer $token")
+            }
+            return conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+        }
+
+        // Latest Commit SHA
+        val commitsRaw = getJson("https://api.github.com/repos/$repo/commits?per_page=1")
+        val commitsArr = JSONArray(commitsRaw)
+        if (commitsArr.length() > 0) {
+            val latest = commitsArr.getJSONObject(0)
+            val sha = latest.optString("sha", "")
+            val msg = latest.optJSONObject("commit")?.optString("message", "") ?: ""
+            out.put("latest_commit_sha", sha)
+            out.put("latest_commit_message", msg)
+
+            if (path.isNotEmpty()) {
+                val fileRaw = getJson("https://api.github.com/repos/$repo/contents/$path?ref=$sha")
+                val fileObj = JSONObject(fileRaw)
+                val b64Content = fileObj.optString("content", "").replace("\n", "").replace("\r", "")
+                val decoded = String(Base64.decode(b64Content, Base64.DEFAULT), Charsets.UTF_8)
+                val sha256 = MessageDigest.getInstance("SHA-256").digest(decoded.toByteArray(Charsets.UTF_8))
+                    .joinToString("") { "%02x".format(it) }
+
+                out.put("verified_file_path", fileObj.optString("path", path))
+                out.put("verified_file_size", decoded.length)
+                out.put("verified_file_sha256", sha256)
+                if (expectedSubstring.isNotEmpty()) {
+                    out.put("content_matches_expected", decoded.contains(expectedSubstring))
+                }
+            }
+        }
+
+        // Latest Workflow Run & Jobs
+        val runsRaw = getJson("https://api.github.com/repos/$repo/actions/runs?per_page=1")
+        val runsArr = JSONObject(runsRaw).optJSONArray("workflow_runs")
+        if (runsArr != null && runsArr.length() > 0) {
+            val run = runsArr.getJSONObject(0)
+            val runId = run.optLong("id", 0L)
+            out.put("workflow_run_id", runId)
+            out.put("workflow_head_sha", run.optString("head_sha", ""))
+            out.put("workflow_status", run.optString("status", ""))
+            out.put("workflow_conclusion", run.optString("conclusion", ""))
+
+            if (runId > 0L) {
+                val jobsRaw = getJson("https://api.github.com/repos/$repo/actions/runs/$runId/jobs")
+                val jobsArr = JSONObject(jobsRaw).optJSONArray("jobs") ?: JSONArray()
+                val stepsReport = JSONArray()
+                for (j in 0 until jobsArr.length()) {
+                    val job = jobsArr.getJSONObject(j)
+                    val steps = job.optJSONArray("steps") ?: JSONArray()
+                    for (s in 0 until steps.length()) {
+                        val st = steps.getJSONObject(s)
+                        stepsReport.put(
+                            JSONObject()
+                                .put("name", st.optString("name", ""))
+                                .put("status", st.optString("status", ""))
+                                .put("conclusion", st.optString("conclusion", ""))
+                        )
+                    }
+                }
+                out.put("job_steps", stepsReport)
+            }
+        }
+        return out
     }
 
     // ==================== MULTI-TAB ENGINE (UI + AI CAPABILITY) ====================
@@ -464,7 +713,6 @@ class MainActivity : Activity() {
         }
         if (query.isNotBlank()) {
             val q = query.trim().lowercase(Locale.ROOT)
-            // Check "tab 2" or "#2" pattern
             val numMatch = Regex("(?:tab\\s*#?|#)(\\d+)").find(q)
             if (numMatch != null) {
                 val parsedId = numMatch.groupValues[1].toIntOrNull() ?: -1
@@ -1194,13 +1442,11 @@ class MainActivity : Activity() {
         }
     }
 
-    // Includes React/Vue/Angular State-Preserving Input Setter + In-DOM Select Modal + Auto-Allow
     private fun injectStealthViewportAndTracker(tab: BrowserTab) {
         val isPc = if (tab.desktopMode) "true" else "false"
         val js = """
             (function() {
                 try {
-                    // 1. Stealth Spoofing for Google Login Acceptance
                     Object.defineProperty(navigator, 'webdriver', { get: () => false, configurable: true });
                     window.chrome = window.chrome || { runtime: {}, app: {}, csi: function(){}, loadTimes: function(){} };
                     Object.defineProperty(navigator, 'vendor', { get: () => 'Google Inc.', configurable: true });
@@ -1230,7 +1476,7 @@ class MainActivity : Activity() {
                     });
                 } catch (e) {}
 
-                // 2. React / Vue / Angular / GitHub State-Safe Value Setter (Prevents text disappearing on blur/click!)
+                // React / Vue / Angular / GitHub State-Safe Value Setter
                 window.__aiSetReactSafeValue = function(el, newValue, insertedDelta, isAppend) {
                     if (!el) return 'no_element';
                     try { el.focus(); } catch (e) {}
@@ -1271,8 +1517,6 @@ class MainActivity : Activity() {
                             el.value = targetVal;
                         }
 
-                        // Crucial: Reset React's internal _valueTracker to prevVal BEFORE firing 'input'
-                        // so React detects the diff and updates its internal state permanently!
                         if (el._valueTracker) {
                             try { el._valueTracker.setValue(prevVal); } catch (e) {}
                         }
@@ -1291,7 +1535,6 @@ class MainActivity : Activity() {
                     return 'unknown';
                 };
 
-                // Helper to commit any active input state before clicking buttons like "Create"
                 window.__aiCommitActiveInput = function() {
                     try {
                         const active = document.activeElement;
@@ -1302,7 +1545,6 @@ class MainActivity : Activity() {
                     } catch (e) {}
                 };
 
-                // 3. Smart In-DOM <select> Modal Builder
                 window.__aiOpenSelectModal = function(selectEl) {
                     if (!selectEl || selectEl.tagName !== 'SELECT') return false;
                     const existing = document.getElementById('__ai_select_modal');
@@ -1367,7 +1609,6 @@ class MainActivity : Activity() {
                     }, true);
                 }
 
-                // 4. Intercept <a download> blob links automatically
                 if (!window.__aiDownloadHooked) {
                     window.__aiDownloadHooked = true;
                     document.addEventListener('click', function(e) {
@@ -1391,7 +1632,6 @@ class MainActivity : Activity() {
                     }, true);
                 }
 
-                // 5. Auto-Click Newly Appeared Latest "Allow" Button (Gemini MCP Tool Confirmation)
                 if (!window.__geminiAllowClickerInstalled) {
                     window.__geminiAllowClickerInstalled = true;
 
@@ -1687,7 +1927,7 @@ class MainActivity : Activity() {
                 } else {
                     JSONObject()
                         .put("status", "error")
-                        .put("message", "Tab not found (tab_id=$targetId, index=$idx, query=$query)")
+                        .put("message", "Tab not found")
                         .put("available_tabs", buildTabsJsonArray())
                         .toString()
                 }
@@ -1732,7 +1972,6 @@ class MainActivity : Activity() {
         appendLog("$method $path")
         setConsoleStatus("🟢 127.0.0.1:$SERVER_PORT | CMD: $method $path", false)
 
-        // Allow optional "tab_id" in ANY command to auto-switch before executing
         if (body != null && body.has("tab_id") && !path.startsWith("/tab") && path != "/close_tab" && path != "/switch_tab") {
             val reqTabId = body.optInt("tab_id", -1)
             if (reqTabId > 0 && activeTab?.id != reqTabId) {
@@ -1760,6 +1999,8 @@ class MainActivity : Activity() {
                     .put("userscripts_count", getSavedUserScripts().length())
                     .toString()
             }
+
+            "/verify", "/github_verify" -> performGitHubVerificationSync(body)
 
             "/tabs", "/tab" -> {
                 val defAct = if (body != null && (body.has("tab_id") || body.has("index")) && !body.has("action")) "switch" else "list"
@@ -1942,7 +2183,6 @@ class MainActivity : Activity() {
         }
     }
 
-    // Includes Virtual Tab Elements (IDs 9001+, 9099) so AI can switch/open tabs directly via /dom & /click!
     private fun extractDomSync(showBoxes: Boolean): String {
         val overlayW = overlayView.width.coerceAtLeast(1)
         val js = """
@@ -2033,7 +2273,6 @@ class MainActivity : Activity() {
             } catch (_: Exception) {}
         }
 
-        // Append Virtual Browser Tab Controls (IDs 9000+tabId and 9099 for +New Tab) so AI can see & click tabs!
         val curId = activeTab?.id ?: -1
         for (t in tabs) {
             val isCur = (t.id == curId)
@@ -2060,10 +2299,8 @@ class MainActivity : Activity() {
     }
 
     private fun performSmartClickSync(elementId: Int, rawX: Float, rawY: Float, matchText: String = ""): String {
-        // 0. Commit any active input value FIRST so React/Vue/GitHub doesn't lose typed text when clicking "Create"!
         evalJsSync("(function(){ if (window.__aiCommitActiveInput) window.__aiCommitActiveInput(); })()")
 
-        // 1. Handle Virtual Browser Tab IDs (9001..9099) clicked by AI
         if (elementId == 9099) {
             var created: BrowserTab? = null
             runOnMainSync { created = createNewTab("https://gemini.google.com", switchToIt = true) }
@@ -2091,7 +2328,6 @@ class MainActivity : Activity() {
         val wvW = webView.width.coerceAtLeast(1)
         val wvScaleRatio = wvW.toFloat() / overlayW.toFloat()
 
-        // 2. If matchText is provided, check if AI asked to switch tab by text OR click page element by text
         if (matchText.isNotEmpty()) {
             val lowerMatch = matchText.trim().lowercase(Locale.ROOT)
             if (lowerMatch.startsWith("switch to tab") || lowerMatch.startsWith("[switch to tab") || Regex("^tab\\s*#?\\d+$").matches(lowerMatch)) {
@@ -2215,6 +2451,7 @@ class MainActivity : Activity() {
             }
         }
 
+        val urlBeforeClick = currentUrl
         val wvTouchX = screenX * wvScaleRatio
         val wvTouchY = screenY * wvScaleRatio
         val holdMs = (55..110).random().toLong()
@@ -2246,11 +2483,14 @@ class MainActivity : Activity() {
             """.trimIndent())
         }
 
-        Thread.sleep(holdMs)
+        Thread.sleep(holdMs + 120)
         return JSONObject()
             .put("status", "clicked")
+            .put("note", "Click dispatched. For GitHub commits or Actions, call /verify to confirm actual commit_sha, file_path, content & run logs.")
             .put("tab_id", activeTab?.id ?: -1)
             .put("element_id", elementId)
+            .put("url_before", urlBeforeClick)
+            .put("url_after", currentUrl)
             .put("x", screenX)
             .put("y", screenY)
             .toString()
@@ -2286,7 +2526,6 @@ class MainActivity : Activity() {
         """.trimIndent())
     }
 
-    // Fixed Human Typing: Uses React _valueTracker reset + pinned target element + final state commit!
     private fun performHumanTypingSync(elementId: Int, text: String, clear: Boolean, submit: Boolean, instant: Boolean): String {
         if (elementId > 0) {
             performSmartClickSync(elementId, -1f, -1f)
@@ -2379,7 +2618,6 @@ class MainActivity : Activity() {
             Thread.sleep((28..72).random().toLong())
         }
 
-        // Final commit so React/Angular/Vue locks in the value even when focus moves to "Create" button
         val finalRead = evalJsSync("""
             (function() {
                 let el = $elementId > 0 ? document.querySelector('[data-ai-id="$elementId"]') : document.activeElement;
@@ -2400,12 +2638,11 @@ class MainActivity : Activity() {
             .put("tab_id", activeTab?.id ?: -1)
             .put("element_id", elementId)
             .put("length", text.length)
-            .put("current_value", finalRead)
+            .put("verified_input_value", finalRead)
             .put("submitted", submit)
             .toString()
     }
 
-    // Full CodeMirror 6 + Monaco + React-Safe Input Engine
     private fun performCodeEditorActionSync(body: JSONObject): String {
         val action = body.optString("action", "get_code").lowercase(Locale.ROOT)
         val inputB64 = body.optString("text_b64", "")
