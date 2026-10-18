@@ -29,6 +29,7 @@ import java.io.*
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.URLDecoder
 import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.*
@@ -377,7 +378,7 @@ class MainActivity : Activity() {
         setContentView(root)
     }
 
-    // ==================== MULTI-TAB ENGINE (UI + STATE) ====================
+    // ==================== MULTI-TAB ENGINE (UI + AI CAPABILITY) ====================
 
     private fun createNewTab(initialUrl: String = "https://gemini.google.com", switchToIt: Boolean = true): BrowserTab {
         val id = nextTabId.getAndIncrement()
@@ -387,6 +388,8 @@ class MainActivity : Activity() {
                 ViewGroup.LayoutParams.MATCH_PARENT
             )
             visibility = View.GONE
+            isFocusable = true
+            isFocusableInTouchMode = true
         }
         val newTab = BrowserTab(id = id, webView = wv, url = initialUrl, title = "Tab $id")
         configureWebViewForTab(newTab)
@@ -399,8 +402,11 @@ class MainActivity : Activity() {
             refreshTabBarUi()
         }
 
-        wv.loadUrl(initialUrl)
+        if (initialUrl.isNotBlank()) {
+            wv.loadUrl(initialUrl)
+        }
         appendLog("➕ Opened Tab #$id -> $initialUrl")
+        broadcastSse("tab_created", JSONObject().put("tab_id", id).put("url", initialUrl).toString())
         return newTab
     }
 
@@ -410,18 +416,20 @@ class MainActivity : Activity() {
         for (t in tabs) {
             t.webView.visibility = if (t.id == targetTab.id) View.VISIBLE else View.GONE
         }
+        targetTab.webView.requestFocus()
         urlInput.setText(targetTab.url)
         desktopBtn.text = if (targetTab.desktopMode) "PC" else "MOB"
         desktopBtn.setBackgroundColor(if (targetTab.desktopMode) Color.parseColor("#1565C0") else Color.parseColor("#333333"))
         updateWebViewViewportBounds(targetTab)
         overlayView.clearHighlights()
         refreshTabBarUi()
-        appendLog("🔄 Switched to Tab #${targetTab.id}")
+        setConsoleStatus("🟢 127.0.0.1:$SERVER_PORT | Active Tab #${targetTab.id}", false)
+        appendLog("🔄 Switched to Tab #${targetTab.id} (${targetTab.title.take(20)})")
+        broadcastSse("tab_switched", JSONObject().put("tab_id", targetTab.id).put("url", targetTab.url).toString())
     }
 
     private fun closeTab(targetTab: BrowserTab) {
         if (tabs.size <= 1) {
-            // If it's the last remaining tab, reset it to Gemini home
             targetTab.webView.loadUrl("https://gemini.google.com")
             Toast.makeText(this, "Reset Tab #${targetTab.id}", Toast.LENGTH_SHORT).show()
             return
@@ -437,6 +445,7 @@ class MainActivity : Activity() {
         } catch (_: Exception) {}
 
         appendLog("✕ Closed Tab #${targetTab.id}")
+        broadcastSse("tab_closed", targetTab.id.toString())
 
         if (wasActive && tabs.isNotEmpty()) {
             val nextIdx = idx.coerceIn(0, tabs.size - 1)
@@ -444,6 +453,29 @@ class MainActivity : Activity() {
         } else {
             refreshTabBarUi()
         }
+    }
+
+    private fun findTabByQuery(tabId: Int = -1, index: Int = -1, query: String = ""): BrowserTab? {
+        if (tabId > 0) {
+            tabs.find { it.id == tabId }?.let { return it }
+        }
+        if (index in 0 until tabs.size) {
+            return tabs[index]
+        }
+        if (query.isNotBlank()) {
+            val q = query.trim().lowercase(Locale.ROOT)
+            // Check "tab 2" or "#2" pattern
+            val numMatch = Regex("(?:tab\\s*#?|#)(\\d+)").find(q)
+            if (numMatch != null) {
+                val parsedId = numMatch.groupValues[1].toIntOrNull() ?: -1
+                tabs.find { it.id == parsedId }?.let { return it }
+                if (parsedId in 1..tabs.size) return tabs[parsedId - 1]
+            }
+            tabs.find {
+                it.title.lowercase(Locale.ROOT).contains(q) || it.url.lowercase(Locale.ROOT).contains(q)
+            }?.let { return it }
+        }
+        return null
     }
 
     private fun refreshTabBarUi() {
@@ -489,7 +521,6 @@ class MainActivity : Activity() {
                 tabBarContainer.addView(tabBox)
             }
 
-            // "+ Tab" Button at the end of Tab Bar
             val addTabBtn = Button(this).apply {
                 text = "+ TAB"
                 textSize = 10f
@@ -508,7 +539,7 @@ class MainActivity : Activity() {
         }
     }
 
-    // ==================== DOWNLOAD ENGINE (HTTP/HTTPS + BLOB + DATA URLs) ====================
+    // ==================== DOWNLOAD ENGINE ====================
 
     private fun startBrowserDownload(
         url: String,
@@ -1018,7 +1049,7 @@ class MainActivity : Activity() {
         s.domStorageEnabled = true
         s.databaseEnabled = true
         s.javaScriptCanOpenWindowsAutomatically = true
-        s.setSupportMultipleWindows(false)
+        s.setSupportMultipleWindows(true)
         s.allowFileAccess = true
         s.allowContentAccess = true
         s.loadWithOverviewMode = true
@@ -1103,6 +1134,19 @@ class MainActivity : Activity() {
         }
 
         wv.webChromeClient = object : WebChromeClient() {
+            override fun onCreateWindow(
+                view: WebView?,
+                isDialog: Boolean,
+                isUserGesture: Boolean,
+                resultMsg: Message?
+            ): Boolean {
+                val transport = resultMsg?.obj as? WebView.WebViewTransport ?: return false
+                val createdTab = createNewTab("", switchToIt = true)
+                transport.webView = createdTab.webView
+                resultMsg.sendToTarget()
+                return true
+            }
+
             override fun onReceivedTitle(view: WebView?, title: String?) {
                 super.onReceivedTitle(view, title)
                 if (!title.isNullOrBlank()) {
@@ -1150,6 +1194,7 @@ class MainActivity : Activity() {
         }
     }
 
+    // Includes React/Vue/Angular State-Preserving Input Setter + In-DOM Select Modal + Auto-Allow
     private fun injectStealthViewportAndTracker(tab: BrowserTab) {
         val isPc = if (tab.desktopMode) "true" else "false"
         val js = """
@@ -1185,7 +1230,144 @@ class MainActivity : Activity() {
                     });
                 } catch (e) {}
 
-                // 2. Intercept <a download> blob links automatically
+                // 2. React / Vue / Angular / GitHub State-Safe Value Setter (Prevents text disappearing on blur/click!)
+                window.__aiSetReactSafeValue = function(el, newValue, insertedDelta, isAppend) {
+                    if (!el) return 'no_element';
+                    try { el.focus(); } catch (e) {}
+
+                    const isEditable = el.isContentEditable || el.getAttribute('contenteditable') === 'true' || el.classList.contains('inputarea');
+                    if (isEditable) {
+                        if (!isAppend) {
+                            const sel = window.getSelection();
+                            const range = document.createRange();
+                            range.selectNodeContents(el);
+                            sel.removeAllRanges();
+                            sel.addRange(range);
+                            document.execCommand('delete', false, null);
+                            if ((el.innerText || '').trim().length > 0) el.innerText = '';
+                        }
+                        if (insertedDelta && insertedDelta.length > 0) {
+                            if (!document.execCommand('insertText', false, insertedDelta)) {
+                                el.innerText = newValue;
+                            }
+                        }
+                        el.dispatchEvent(new InputEvent('input', { data: insertedDelta || newValue, inputType: 'insertText', bubbles: true, cancelable: false, composed: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                        return 'contenteditable';
+                    }
+
+                    if ('value' in el) {
+                        const prevVal = el.value || '';
+                        const targetVal = isAppend ? (prevVal + (insertedDelta || '')) : newValue;
+
+                        const proto = el.tagName === 'TEXTAREA'
+                            ? window.HTMLTextAreaElement.prototype
+                            : window.HTMLInputElement.prototype;
+                        const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+
+                        if (desc && desc.set) {
+                            desc.set.call(el, targetVal);
+                        } else {
+                            el.value = targetVal;
+                        }
+
+                        // Crucial: Reset React's internal _valueTracker to prevVal BEFORE firing 'input'
+                        // so React detects the diff and updates its internal state permanently!
+                        if (el._valueTracker) {
+                            try { el._valueTracker.setValue(prevVal); } catch (e) {}
+                        }
+
+                        try {
+                            if (typeof el.setSelectionRange === 'function') {
+                                el.setSelectionRange(targetVal.length, targetVal.length);
+                            }
+                        } catch (e) {}
+
+                        el.dispatchEvent(new InputEvent('beforeinput', { data: insertedDelta || targetVal, inputType: 'insertText', bubbles: true, cancelable: true, composed: true }));
+                        el.dispatchEvent(new InputEvent('input', { data: insertedDelta || targetVal, inputType: 'insertText', bubbles: true, cancelable: false, composed: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                        return 'react_safe_input';
+                    }
+                    return 'unknown';
+                };
+
+                // Helper to commit any active input state before clicking buttons like "Create"
+                window.__aiCommitActiveInput = function() {
+                    try {
+                        const active = document.activeElement;
+                        if (active && ('value' in active || active.isContentEditable)) {
+                            active.dispatchEvent(new Event('input', { bubbles: true }));
+                            active.dispatchEvent(new Event('change', { bubbles: true }));
+                        }
+                    } catch (e) {}
+                };
+
+                // 3. Smart In-DOM <select> Modal Builder
+                window.__aiOpenSelectModal = function(selectEl) {
+                    if (!selectEl || selectEl.tagName !== 'SELECT') return false;
+                    const existing = document.getElementById('__ai_select_modal');
+                    if (existing) existing.remove();
+
+                    const modal = document.createElement('div');
+                    modal.id = '__ai_select_modal';
+                    modal.style.cssText = 'position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(0,0,0,0.65);z-index:2147483647;display:flex;align-items:center;justify-content:center;padding:16px;box-sizing:border-box;font-family:sans-serif;';
+
+                    const card = document.createElement('div');
+                    card.style.cssText = 'background:#2b2b2b;color:#fff;width:100%;max-width:420px;max-height:82vh;border-radius:12px;overflow-y:auto;box-shadow:0 10px 30px rgba(0,0,0,0.8);border:1px solid #444;';
+
+                    for (let i = 0; i < selectEl.options.length; i++) {
+                        const opt = selectEl.options[i];
+                        const isSelected = (selectEl.selectedIndex === i);
+                        const item = document.createElement('div');
+                        item.setAttribute('role', 'option');
+                        item.setAttribute('data-ai-select-index', i);
+                        item.setAttribute('data-ai-option-value', opt.value || '');
+                        item.style.cssText = 'padding:14px 18px;border-bottom:1px solid #3d3d3d;display:flex;align-items:center;justify-content:space-between;cursor:pointer;font-size:15px;' + (isSelected ? 'background:#1e3a2f;color:#00e676;font-weight:bold;' : '');
+
+                        const spanTxt = document.createElement('span');
+                        spanTxt.textContent = (opt.text || opt.label || opt.value || '').trim();
+
+                        const radio = document.createElement('span');
+                        radio.textContent = isSelected ? '◉' : '○';
+                        radio.style.cssText = 'font-size:18px;margin-left:12px;color:' + (isSelected ? '#4dd0e1' : '#aaa') + ';';
+
+                        item.appendChild(spanTxt);
+                        item.appendChild(radio);
+
+                        item.addEventListener('click', function(ev) {
+                            ev.stopPropagation();
+                            selectEl.selectedIndex = i;
+                            selectEl.value = opt.value;
+                            selectEl.dispatchEvent(new Event('focus', { bubbles: true }));
+                            selectEl.dispatchEvent(new Event('input', { bubbles: true }));
+                            selectEl.dispatchEvent(new Event('change', { bubbles: true }));
+                            if (window.jQuery) { try { window.jQuery(selectEl).trigger('change'); } catch (e) {} }
+                            modal.remove();
+                        });
+                        card.appendChild(item);
+                    }
+
+                    modal.addEventListener('click', function(ev) {
+                        if (ev.target === modal) modal.remove();
+                    });
+                    modal.appendChild(card);
+                    document.body.appendChild(modal);
+                    return true;
+                };
+
+                if (!window.__aiSelectHooked) {
+                    window.__aiSelectHooked = true;
+                    document.addEventListener('mousedown', function(e) {
+                        const sel = e.target && e.target.closest ? e.target.closest('select') : null;
+                        if (sel && !sel.multiple) {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            window.__aiOpenSelectModal(sel);
+                        }
+                    }, true);
+                }
+
+                // 4. Intercept <a download> blob links automatically
                 if (!window.__aiDownloadHooked) {
                     window.__aiDownloadHooked = true;
                     document.addEventListener('click', function(e) {
@@ -1209,7 +1391,7 @@ class MainActivity : Activity() {
                     }, true);
                 }
 
-                // 3. Auto-Click Newly Appeared Latest "Allow" Button (Gemini MCP Tool Confirmation)
+                // 5. Auto-Click Newly Appeared Latest "Allow" Button (Gemini MCP Tool Confirmation)
                 if (!window.__geminiAllowClickerInstalled) {
                     window.__geminiAllowClickerInstalled = true;
 
@@ -1352,6 +1534,22 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun parseQueryParams(rawPath: String): JSONObject {
+        val obj = JSONObject()
+        val qStr = rawPath.substringAfter("?", "")
+        if (qStr.isEmpty()) return obj
+        for (pair in qStr.split("&")) {
+            val parts = pair.split("=", limit = 2)
+            if (parts.isNotEmpty() && parts[0].isNotEmpty()) {
+                val k = URLDecoder.decode(parts[0], "UTF-8")
+                val v = if (parts.size > 1) URLDecoder.decode(parts[1], "UTF-8") else ""
+                val intVal = v.toIntOrNull()
+                if (intVal != null) obj.put(k, intVal) else obj.put(k, v)
+            }
+        }
+        return obj
+    }
+
     private fun handleClientSocket(socket: Socket) {
         try {
             socket.soTimeout = 30000
@@ -1386,8 +1584,10 @@ class MainActivity : Activity() {
             } else ""
 
             val jsonBody = if (bodyStr.trim().isNotEmpty()) {
-                try { JSONObject(bodyStr) } catch (_: Exception) { null }
-            } else null
+                try { JSONObject(bodyStr) } catch (_: Exception) { parseQueryParams(rawPath) }
+            } else {
+                parseQueryParams(rawPath)
+            }
 
             if (path == "/events") {
                 val pw = PrintWriter(OutputStreamWriter(out, Charsets.UTF_8), true)
@@ -1426,10 +1626,13 @@ class MainActivity : Activity() {
     private fun buildTabsJsonArray(): JSONArray {
         val arr = JSONArray()
         val curId = activeTab?.id ?: -1
-        for (t in tabs) {
+        for (i in 0 until tabs.size) {
+            val t = tabs[i]
             arr.put(
                 JSONObject()
                     .put("tab_id", t.id)
+                    .put("index", i)
+                    .put("virtual_dom_id", 9000 + t.id)
                     .put("active", t.id == curId)
                     .put("url", t.url)
                     .put("title", t.title)
@@ -1440,8 +1643,8 @@ class MainActivity : Activity() {
         return arr
     }
 
-    private fun handleTabsApiSync(body: JSONObject?): String {
-        val action = body?.optString("action", "list")?.lowercase(Locale.ROOT) ?: "list"
+    private fun handleTabsApiSync(defaultAction: String, body: JSONObject?): String {
+        val action = body?.optString("action", defaultAction)?.lowercase(Locale.ROOT) ?: defaultAction
         return when (action) {
             "list" -> {
                 JSONObject()
@@ -1462,26 +1665,60 @@ class MainActivity : Activity() {
                     .put("status", "tab_created")
                     .put("tab_id", createdTab?.id ?: -1)
                     .put("active_tab_id", activeTab?.id ?: -1)
+                    .put("url", createdTab?.url ?: url)
                     .put("tabs_count", tabs.size)
+                    .put("tabs", buildTabsJsonArray())
                     .toString()
             }
-            "switch", "select" -> {
-                val targetId = body?.optInt("tab_id", -1) ?: -1
-                val targetTab = tabs.find { it.id == targetId }
-                    ?: body?.optInt("index", -1)?.let { idx -> if (idx in 0 until tabs.size) tabs[idx] else null }
+            "switch", "select", "activate" -> {
+                val targetId = body?.optInt("tab_id", body.optInt("id", -1)) ?: -1
+                val idx = body?.optInt("index", -1) ?: -1
+                val query = body?.optString("title", body.optString("query", body.optString("url", ""))) ?: ""
+                val targetTab = findTabByQuery(targetId, idx, query)
                 if (targetTab != null) {
                     runOnMainSync { switchToTab(targetTab) }
-                    JSONObject().put("status", "switched").put("active_tab_id", targetTab.id).put("url", targetTab.url).toString()
+                    JSONObject()
+                        .put("status", "switched")
+                        .put("active_tab_id", targetTab.id)
+                        .put("title", targetTab.title)
+                        .put("url", targetTab.url)
+                        .put("tabs", buildTabsJsonArray())
+                        .toString()
                 } else {
-                    JSONObject().put("status", "error").put("message", "Tab not found").toString()
+                    JSONObject()
+                        .put("status", "error")
+                        .put("message", "Tab not found (tab_id=$targetId, index=$idx, query=$query)")
+                        .put("available_tabs", buildTabsJsonArray())
+                        .toString()
                 }
             }
+            "next" -> {
+                if (tabs.size > 1 && activeTab != null) {
+                    val curIdx = tabs.indexOf(activeTab)
+                    val nextTab = tabs[(curIdx + 1) % tabs.size]
+                    runOnMainSync { switchToTab(nextTab) }
+                }
+                JSONObject().put("status", "switched").put("active_tab_id", activeTab?.id ?: -1).put("url", currentUrl).toString()
+            }
+            "prev", "previous" -> {
+                if (tabs.size > 1 && activeTab != null) {
+                    val curIdx = tabs.indexOf(activeTab)
+                    val prevTab = tabs[(curIdx - 1 + tabs.size) % tabs.size]
+                    runOnMainSync { switchToTab(prevTab) }
+                }
+                JSONObject().put("status", "switched").put("active_tab_id", activeTab?.id ?: -1).put("url", currentUrl).toString()
+            }
             "close" -> {
-                val targetId = body?.optInt("tab_id", activeTab?.id ?: -1) ?: (activeTab?.id ?: -1)
-                val targetTab = tabs.find { it.id == targetId }
+                val targetId = body?.optInt("tab_id", body.optInt("id", activeTab?.id ?: -1)) ?: (activeTab?.id ?: -1)
+                val targetTab = findTabByQuery(targetId)
                 if (targetTab != null) {
                     runOnMainSync { closeTab(targetTab) }
-                    JSONObject().put("status", "closed").put("closed_tab_id", targetId).put("active_tab_id", activeTab?.id ?: -1).toString()
+                    JSONObject()
+                        .put("status", "closed")
+                        .put("closed_tab_id", targetId)
+                        .put("active_tab_id", activeTab?.id ?: -1)
+                        .put("tabs", buildTabsJsonArray())
+                        .toString()
                 } else {
                     JSONObject().put("status", "error").put("message", "Tab not found").toString()
                 }
@@ -1494,6 +1731,17 @@ class MainActivity : Activity() {
         isEmergencyStopped.set(false)
         appendLog("$method $path")
         setConsoleStatus("🟢 127.0.0.1:$SERVER_PORT | CMD: $method $path", false)
+
+        // Allow optional "tab_id" in ANY command to auto-switch before executing
+        if (body != null && body.has("tab_id") && !path.startsWith("/tab") && path != "/close_tab" && path != "/switch_tab") {
+            val reqTabId = body.optInt("tab_id", -1)
+            if (reqTabId > 0 && activeTab?.id != reqTabId) {
+                findTabByQuery(tabId = reqTabId)?.let { t ->
+                    runOnMainSync { switchToTab(t) }
+                    Thread.sleep(100)
+                }
+            }
+        }
 
         return when (path) {
             "/", "/status" -> {
@@ -1513,7 +1761,13 @@ class MainActivity : Activity() {
                     .toString()
             }
 
-            "/tabs" -> handleTabsApiSync(body)
+            "/tabs", "/tab" -> {
+                val defAct = if (body != null && (body.has("tab_id") || body.has("index")) && !body.has("action")) "switch" else "list"
+                handleTabsApiSync(defAct, body)
+            }
+            "/switch_tab" -> handleTabsApiSync("switch", body)
+            "/new_tab", "/open_tab" -> handleTabsApiSync("new", body)
+            "/close_tab" -> handleTabsApiSync("close", body)
 
             "/desktop" -> {
                 val enable = body?.optBoolean("enable", !desktopMode) ?: !desktopMode
@@ -1688,11 +1942,12 @@ class MainActivity : Activity() {
         }
     }
 
+    // Includes Virtual Tab Elements (IDs 9001+, 9099) so AI can switch/open tabs directly via /dom & /click!
     private fun extractDomSync(showBoxes: Boolean): String {
         val overlayW = overlayView.width.coerceAtLeast(1)
         val js = """
             (function() {
-                const selectors = 'a, button, input, select, textarea, [role="button"], [role="option"], [role="menuitem"], [role="textbox"], [contenteditable="true"], .monaco-editor, .cm-content';
+                const selectors = 'a, button, input, select, textarea, [role="button"], [role="option"], [role="menuitem"], [role="textbox"], [role="code"], [contenteditable="true"], .monaco-editor, .cm-content, .ace_editor, [onclick], summary';
                 const nodes = document.querySelectorAll(selectors);
                 const scale = $overlayW / (window.innerWidth || 1);
                 const list = [];
@@ -1709,12 +1964,33 @@ class MainActivity : Activity() {
                         const id = idCounter++;
                         el.setAttribute('data-ai-id', id);
                         const tag = el.tagName.toLowerCase();
-                        const rawLabel = (el.innerText || el.value || el.placeholder || el.getAttribute('aria-label') || el.name || '').replace(/\s+/g, ' ').trim();
+                        const isEditor = el.classList.contains('monaco-editor') || el.classList.contains('cm-content') || el.getAttribute('contenteditable') === 'true';
 
-                        list.push({
+                        let rawLabel = '';
+                        let optionsPreview = null;
+
+                        if (tag === 'select') {
+                            const selOpt = el.options && el.selectedIndex >= 0 ? el.options[el.selectedIndex] : null;
+                            rawLabel = selOpt ? (selOpt.text || selOpt.value || '') : '';
+                            const opts = [];
+                            if (el.options) {
+                                for (let i = 0; i < Math.min(el.options.length, 25); i++) {
+                                    opts.push((el.options[i].text || el.options[i].value || '').trim());
+                                }
+                            }
+                            optionsPreview = opts;
+                        } else {
+                            rawLabel = (el.innerText || el.value || el.placeholder || el.getAttribute('aria-label') || el.name || (isEditor ? 'Code Editor' : '')).replace(/\s+/g, ' ').trim();
+                            if (rawLabel.length <= 4 && el.parentElement) {
+                                const rowText = (el.parentElement.innerText || '').replace(/\s+/g, ' ').trim();
+                                if (rowText.length > rawLabel.length) rawLabel = rowText;
+                            }
+                        }
+
+                        const itemObj = {
                             id: id,
-                            tag: tag,
-                            type: el.type || '',
+                            tag: isEditor ? 'code-editor' : (el.getAttribute('role') === 'option' ? 'dropdown-option' : tag),
+                            type: el.type || (tag === 'select' ? 'dropdown' : (isEditor ? 'monaco/codemirror' : '')),
                             text: rawLabel.slice(0, 140),
                             x: Math.round((r.left + r.width / 2) * scale),
                             y: Math.round((r.top + r.height / 2) * scale),
@@ -1724,7 +2000,9 @@ class MainActivity : Activity() {
                             bottom: Math.round(r.bottom * scale),
                             width: Math.round(r.width * scale),
                             height: Math.round(r.height * scale)
-                        });
+                        };
+                        if (optionsPreview) itemObj.options = optionsPreview;
+                        list.push(itemObj);
                     }
                 });
                 return JSON.stringify(list);
@@ -1732,12 +2010,17 @@ class MainActivity : Activity() {
         """.trimIndent()
 
         val jsonStr = evalJsSync(js)
-        if (showBoxes && jsonStr.startsWith("[")) {
+        val finalArr = try {
+            if (jsonStr.startsWith("[")) JSONArray(jsonStr) else JSONArray()
+        } catch (_: Exception) {
+            JSONArray()
+        }
+
+        if (showBoxes && finalArr.length() > 0) {
             try {
-                val arr = JSONArray(jsonStr)
                 val boxes = mutableListOf<Pair<RectF, String>>()
-                for (i in 0 until arr.length()) {
-                    val o = arr.getJSONObject(i)
+                for (i in 0 until finalArr.length()) {
+                    val o = finalArr.getJSONObject(i)
                     val rect = RectF(
                         o.getDouble("left").toFloat(),
                         o.getDouble("top").toFloat(),
@@ -1749,27 +2032,112 @@ class MainActivity : Activity() {
                 runOnMainSync { overlayView.showDomBoxes(boxes) }
             } catch (_: Exception) {}
         }
-        return if (jsonStr.isNotEmpty()) jsonStr else "[]"
+
+        // Append Virtual Browser Tab Controls (IDs 9000+tabId and 9099 for +New Tab) so AI can see & click tabs!
+        val curId = activeTab?.id ?: -1
+        for (t in tabs) {
+            val isCur = (t.id == curId)
+            finalArr.put(
+                JSONObject()
+                    .put("id", 9000 + t.id)
+                    .put("tag", "browser-tab")
+                    .put("type", if (isCur) "active_tab" else "switch_tab")
+                    .put("tab_id", t.id)
+                    .put("text", (if (isCur) "[ACTIVE TAB #${t.id}] " else "[SWITCH TO TAB #${t.id}] ") + t.title.take(40) + " (" + t.url.take(50) + ")")
+                    .put("x", 0).put("y", 0).put("left", 0).put("top", 0).put("right", 0).put("bottom", 0).put("width", 0).put("height", 0)
+            )
+        }
+        finalArr.put(
+            JSONObject()
+                .put("id", 9099)
+                .put("tag", "browser-tab-new")
+                .put("type", "new_tab_button")
+                .put("text", "[+ NEW TAB] Open a new browser tab")
+                .put("x", 0).put("y", 0).put("left", 0).put("top", 0).put("right", 0).put("bottom", 0).put("width", 0).put("height", 0)
+        )
+
+        return finalArr.toString()
     }
 
     private fun performSmartClickSync(elementId: Int, rawX: Float, rawY: Float, matchText: String = ""): String {
+        // 0. Commit any active input value FIRST so React/Vue/GitHub doesn't lose typed text when clicking "Create"!
+        evalJsSync("(function(){ if (window.__aiCommitActiveInput) window.__aiCommitActiveInput(); })()")
+
+        // 1. Handle Virtual Browser Tab IDs (9001..9099) clicked by AI
+        if (elementId == 9099) {
+            var created: BrowserTab? = null
+            runOnMainSync { created = createNewTab("https://gemini.google.com", switchToIt = true) }
+            return JSONObject()
+                .put("status", "new_tab_opened")
+                .put("tab_id", created?.id ?: -1)
+                .put("tabs", buildTabsJsonArray())
+                .toString()
+        }
+        if (elementId in 9001..9098) {
+            val targetTabId = elementId - 9000
+            val targetTab = findTabByQuery(tabId = targetTabId)
+            if (targetTab != null) {
+                runOnMainSync { switchToTab(targetTab) }
+                return JSONObject()
+                    .put("status", "switched_tab")
+                    .put("active_tab_id", targetTab.id)
+                    .put("title", targetTab.title)
+                    .put("url", targetTab.url)
+                    .toString()
+            }
+        }
+
         val overlayW = overlayView.width.coerceAtLeast(1)
         val wvW = webView.width.coerceAtLeast(1)
         val wvScaleRatio = wvW.toFloat() / overlayW.toFloat()
 
+        // 2. If matchText is provided, check if AI asked to switch tab by text OR click page element by text
         if (matchText.isNotEmpty()) {
+            val lowerMatch = matchText.trim().lowercase(Locale.ROOT)
+            if (lowerMatch.startsWith("switch to tab") || lowerMatch.startsWith("[switch to tab") || Regex("^tab\\s*#?\\d+$").matches(lowerMatch)) {
+                val tabTarget = findTabByQuery(query = lowerMatch)
+                if (tabTarget != null) {
+                    runOnMainSync { switchToTab(tabTarget) }
+                    return JSONObject()
+                        .put("status", "switched_tab")
+                        .put("active_tab_id", tabTarget.id)
+                        .put("url", tabTarget.url)
+                        .toString()
+                }
+            }
+
             val safeTarget = matchText.replace("\\", "\\\\").replace("'", "\\'")
             val textClickRes = evalJsSync("""
                 (function() {
+                    if (window.__aiCommitActiveInput) window.__aiCommitActiveInput();
                     const q = '$safeTarget'.trim().toLowerCase();
-                    const nodes = document.querySelectorAll('[role="option"], [role="menuitem"], button, a, [role="button"], span, div');
+                    const selects = document.querySelectorAll('select');
+                    for (let s = 0; s < selects.length; s++) {
+                        const sel = selects[s];
+                        for (let i = 0; i < sel.options.length; i++) {
+                            const opt = sel.options[i];
+                            const txt = (opt.text || opt.label || opt.value || '').trim().toLowerCase();
+                            if (txt === q || txt.includes(q)) {
+                                sel.selectedIndex = i;
+                                sel.value = opt.value;
+                                sel.dispatchEvent(new Event('focus', { bubbles: true }));
+                                sel.dispatchEvent(new Event('input', { bubbles: true }));
+                                sel.dispatchEvent(new Event('change', { bubbles: true }));
+                                if (window.jQuery) { try { window.jQuery(sel).trigger('change'); } catch(e){} }
+                                const modal = document.getElementById('__ai_select_modal');
+                                if (modal) modal.remove();
+                                return JSON.stringify({ status: 'selected_option', option_text: opt.text, index: i, value: opt.value });
+                            }
+                        }
+                    }
+                    const nodes = document.querySelectorAll('[role="option"], [role="menuitem"], button, a, input[type="submit"], input[type="button"], [role="button"], span, div');
                     for (let i = nodes.length - 1; i >= 0; i--) {
                         const el = nodes[i];
-                        const t = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                        const t = (el.innerText || el.value || el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
                         if (t === q) {
                             el.scrollIntoView({ behavior: 'instant', block: 'center' });
                             el.click();
-                            return JSON.stringify({ status: 'clicked_by_text', text: el.innerText.trim() });
+                            return JSON.stringify({ status: 'clicked_by_text', text: t });
                         }
                     }
                     return '';
@@ -1783,6 +2151,36 @@ class MainActivity : Activity() {
         var targetRect: RectF? = null
 
         if (elementId > 0) {
+            val specialCheck = evalJsSync("""
+                (function() {
+                    const el = document.querySelector('[data-ai-id="$elementId"]');
+                    if (!el) return '';
+                    if (el.getAttribute('role') === 'option' && el.hasAttribute('data-ai-select-index')) {
+                        const txt = (el.innerText || '').trim();
+                        el.click();
+                        return JSON.stringify({ status: 'selected_dropdown_option', element_id: $elementId, selected_text: txt });
+                    }
+                    if (el.tagName.toLowerCase() === 'select') {
+                        if (window.__aiOpenSelectModal) window.__aiOpenSelectModal(el);
+                        const opts = [];
+                        for (let i = 0; i < el.options.length; i++) {
+                            opts.push({ index: i, text: (el.options[i].text || '').trim(), value: el.options[i].value });
+                        }
+                        return JSON.stringify({
+                            status: 'select_dropdown_opened',
+                            element_id: $elementId,
+                            options: opts
+                        });
+                    }
+                    return '';
+                })();
+            """.trimIndent())
+
+            if (specialCheck.startsWith("{")) {
+                extractDomSync(true)
+                return specialCheck
+            }
+
             val js = """
                 (function() {
                     const el = document.querySelector('[data-ai-id="$elementId"]');
@@ -1822,6 +2220,7 @@ class MainActivity : Activity() {
         val holdMs = (55..110).random().toLong()
 
         runOnMainSync {
+            webView.requestFocus()
             overlayView.showActionHighlight(screenX, screenY, targetRect, if (elementId > 0) "CLICK [$elementId]" else "TAP")
             val downTime = SystemClock.uptimeMillis()
             val down = MotionEvent.obtain(downTime, downTime, MotionEvent.ACTION_DOWN, wvTouchX, wvTouchY, 0)
@@ -1833,11 +2232,28 @@ class MainActivity : Activity() {
         }
 
         if (elementId > 0) {
-            evalJsSync("(function(){ const el = document.querySelector('[data-ai-id=\"$elementId\"]'); if (el) el.focus(); })()")
+            evalJsSync("""
+                (function() {
+                    const el = document.querySelector('[data-ai-id="$elementId"]');
+                    if (!el) return;
+                    if (el.classList.contains('monaco-editor')) {
+                        const ta = el.querySelector('textarea.inputarea') || el.querySelector('textarea');
+                        if (ta) ta.focus(); else el.focus();
+                    } else {
+                        el.focus();
+                    }
+                })();
+            """.trimIndent())
         }
 
         Thread.sleep(holdMs)
-        return JSONObject().put("status", "clicked").put("element_id", elementId).put("x", screenX).put("y", screenY).toString()
+        return JSONObject()
+            .put("status", "clicked")
+            .put("tab_id", activeTab?.id ?: -1)
+            .put("element_id", elementId)
+            .put("x", screenX)
+            .put("y", screenY)
+            .toString()
     }
 
     private fun performSelectSync(elementId: Int, value: String, text: String, index: Int): String {
@@ -1858,7 +2274,11 @@ class MainActivity : Activity() {
                 if (chosenIdx >= 0 && chosenIdx < el.options.length) {
                     el.selectedIndex = chosenIdx;
                     el.value = el.options[chosenIdx].value;
+                    el.dispatchEvent(new Event('focus', { bubbles: true }));
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
                     el.dispatchEvent(new Event('change', { bubbles: true }));
+                    const modal = document.getElementById('__ai_select_modal');
+                    if (modal) modal.remove();
                     return JSON.stringify({ status: 'selected', selected_index: chosenIdx, selected_text: el.options[chosenIdx].text });
                 }
                 return JSON.stringify({ status: 'option_not_found' });
@@ -1866,40 +2286,126 @@ class MainActivity : Activity() {
         """.trimIndent())
     }
 
+    // Fixed Human Typing: Uses React _valueTracker reset + pinned target element + final state commit!
     private fun performHumanTypingSync(elementId: Int, text: String, clear: Boolean, submit: Boolean, instant: Boolean): String {
         if (elementId > 0) {
             performSmartClickSync(elementId, -1f, -1f)
             Thread.sleep(150)
+        } else {
+            runOnMainSync { webView.requestFocus() }
         }
-        if (clear) performCodeEditorActionSync(JSONObject().put("action", "clear"))
-        if (instant) return performCodeEditorActionSync(JSONObject().put("action", "insert").put("text", text))
+
+        if (clear) {
+            if (elementId > 0) {
+                evalJsSync("""
+                    (function() {
+                        const el = document.querySelector('[data-ai-id="$elementId"]');
+                        if (el && window.__aiSetReactSafeValue) window.__aiSetReactSafeValue(el, '', '', false);
+                    })();
+                """.trimIndent())
+            } else {
+                performCodeEditorActionSync(JSONObject().put("action", "clear"))
+            }
+        }
+
+        if (instant) {
+            if (elementId > 0) {
+                val b64 = Base64.encodeToString(text.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+                val res = evalJsSync("""
+                    (function() {
+                        const bin = atob('$b64');
+                        const bytes = new Uint8Array(bin.length);
+                        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                        const decoded = new TextDecoder('utf-8').decode(bytes);
+                        const el = document.querySelector('[data-ai-id="$elementId"]') || document.activeElement;
+                        if (el && window.__aiSetReactSafeValue) {
+                            window.__aiSetReactSafeValue(el, decoded, decoded, false);
+                            return JSON.stringify({ status: 'typed_instant', length: decoded.length, value: el.value || el.innerText || '' });
+                        }
+                        return '';
+                    })();
+                """.trimIndent())
+                if (res.startsWith("{")) return res
+            }
+            return performCodeEditorActionSync(JSONObject().put("action", "insert").put("text", text))
+        }
 
         for (i in 0 until text.length) {
             if (isEmergencyStopped.get()) return JSONObject().put("status", "stopped").toString()
-            val safe = text[i].toString().replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n").replace("\r", "")
-            evalJsSync("""
+            val ch = text[i]
+            val safe = ch.toString()
+                .replace("\\", "\\\\")
+                .replace("'", "\\'")
+                .replace("\n", "\\n")
+                .replace("\r", "")
+
+            val js = """
                 (function() {
-                    let el = document.activeElement;
+                    if (window.monaco && window.monaco.editor) {
+                        const editors = window.monaco.editor.getEditors ? window.monaco.editor.getEditors() : [];
+                        if (editors.length > 0 && editors[0].hasTextFocus && editors[0].hasTextFocus()) {
+                            editors[0].trigger('keyboard', 'type', { text: '$safe' });
+                            return 'monaco';
+                        }
+                    }
+
+                    let el = $elementId > 0 ? document.querySelector('[data-ai-id="$elementId"]') : document.activeElement;
                     if (!el || el === document.body) {
-                        el = document.querySelector('[contenteditable="true"], input:focus, textarea:focus');
-                        if (el) el.focus();
+                        el = document.querySelector('.cm-content[contenteditable="true"], .monaco-editor textarea.inputarea, [contenteditable="true"], input:focus, textarea:focus, input:not([type="hidden"]), textarea');
                     }
-                    if (!el) return;
-                    if (el.isContentEditable || el.getAttribute('contenteditable') === 'true') {
-                        document.execCommand('insertText', false, '$safe');
+                    if (!el) return 'no_element';
+
+                    el.focus();
+                    el.dispatchEvent(new KeyboardEvent('keydown', { key: '$safe', bubbles: true, cancelable: true }));
+
+                    if (window.__aiSetReactSafeValue) {
+                        window.__aiSetReactSafeValue(el, null, '$safe', true);
                     } else if ('value' in el) {
-                        el.value = (el.value || '') + '$safe';
-                        el.dispatchEvent(new InputEvent('input', { data: '$safe', bubbles: true }));
+                        const prev = el.value || '';
+                        const proto = el.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+                        const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+                        const nextVal = prev + '$safe';
+                        if (desc && desc.set) desc.set.call(el, nextVal); else el.value = nextVal;
+                        if (el._valueTracker) { try { el._valueTracker.setValue(prev); } catch (e) {} }
+                        el.dispatchEvent(new InputEvent('input', { data: '$safe', inputType: 'insertText', bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
                     }
+
+                    el.dispatchEvent(new KeyboardEvent('keyup', { key: '$safe', bubbles: true }));
+                    return 'ok';
                 })();
-            """.trimIndent())
-            Thread.sleep((30..80).random().toLong())
+            """.trimIndent()
+            evalJsSync(js)
+            Thread.sleep((28..72).random().toLong())
         }
 
-        if (submit) performSpecialKeySync("Enter")
-        return JSONObject().put("status", "typed").put("length", text.length).put("submitted", submit).toString()
+        // Final commit so React/Angular/Vue locks in the value even when focus moves to "Create" button
+        val finalRead = evalJsSync("""
+            (function() {
+                let el = $elementId > 0 ? document.querySelector('[data-ai-id="$elementId"]') : document.activeElement;
+                if (!el) return '';
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                return (el.value !== undefined ? el.value : (el.innerText || '')).slice(0, 140);
+            })();
+        """.trimIndent())
+
+        if (submit) {
+            performSpecialKeySync("Enter")
+            evalJsSync("(function(){ const el = document.activeElement; if (el && el.form) el.form.submit(); })()")
+        }
+
+        return JSONObject()
+            .put("status", "typed")
+            .put("tab_id", activeTab?.id ?: -1)
+            .put("element_id", elementId)
+            .put("length", text.length)
+            .put("current_value", finalRead)
+            .put("submitted", submit)
+            .toString()
     }
 
+    // Full CodeMirror 6 + Monaco + React-Safe Input Engine
     private fun performCodeEditorActionSync(body: JSONObject): String {
         val action = body.optString("action", "get_code").lowercase(Locale.ROOT)
         val inputB64 = body.optString("text_b64", "")
@@ -1908,39 +2414,166 @@ class MainActivity : Activity() {
         } else {
             body.optString("text", "")
         }
+        val line = body.optInt("line", 1)
         val b64Text = Base64.encodeToString(text.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
 
-        return evalJsSync("""
+        if ((action == "paste" || action == "set_code" || action == "insert") && text.isNotEmpty()) {
+            runOnMainSync {
+                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                cm.setPrimaryClip(ClipData.newPlainText("ai_paste", text))
+            }
+        }
+
+        val js = """
             (function() {
                 const action = '$action';
-                const bin = atob('$b64Text');
-                const bytes = new Uint8Array(bin.length);
-                for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-                const rawText = new TextDecoder('utf-8').decode(bytes);
+                function decodeB64Utf8(b64) {
+                    if (!b64) return '';
+                    try {
+                        const bin = atob(b64);
+                        const bytes = new Uint8Array(bin.length);
+                        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                        return new TextDecoder('utf-8').decode(bytes);
+                    } catch (e) { return ''; }
+                }
+                const rawText = decodeB64Utf8('$b64Text');
+
+                function findCmView() {
+                    const nodes = document.querySelectorAll('.cm-editor, .cm-content, .cm-scroller, .cm-line');
+                    for (let i = 0; i < nodes.length; i++) {
+                        const cv = nodes[i].cmView;
+                        if (!cv) continue;
+                        if (cv.view && typeof cv.view.dispatch === 'function' && cv.view.state) return cv.view;
+                        if (cv.rootView && cv.rootView.view && typeof cv.rootView.view.dispatch === 'function') return cv.rootView.view;
+                        const keys1 = Object.keys(cv);
+                        for (let j = 0; j < keys1.length; j++) {
+                            const v1 = cv[keys1[j]];
+                            if (v1 && typeof v1 === 'object') {
+                                if (typeof v1.dispatch === 'function' && v1.state && v1.state.doc) return v1;
+                                const keys2 = Object.keys(v1);
+                                for (let k = 0; k < keys2.length; k++) {
+                                    const v2 = v1[keys2[k]];
+                                    if (v2 && typeof v2 === 'object' && typeof v2.dispatch === 'function' && v2.state && v2.state.doc) {
+                                        return v2;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return null;
+                }
+
+                const cmView = findCmView();
+                const cmContent = document.querySelector('.cm-content[contenteditable="true"]');
+                const monacoModels = (window.monaco && window.monaco.editor && window.monaco.editor.getModels)
+                    ? window.monaco.editor.getModels() : [];
+                const monacoEditors = (window.monaco && window.monaco.editor && window.monaco.editor.getEditors)
+                    ? window.monaco.editor.getEditors() : [];
+
                 let target = document.activeElement;
                 if (!target || target === document.body) {
-                    target = document.querySelector('[contenteditable="true"], textarea, input');
+                    target = cmContent || document.querySelector('.monaco-editor textarea.inputarea, [contenteditable="true"], textarea, input:not([type="hidden"])');
                     if (target) target.focus();
                 }
-                if (!target) return JSON.stringify({ status: 'no_target' });
-                if (action === 'clear') {
-                    if (target.isContentEditable) target.innerText = ''; else target.value = '';
-                    target.dispatchEvent(new Event('input', { bubbles: true }));
-                    return JSON.stringify({ status: 'cleared' });
+
+                function readCurrentCode() {
+                    if (monacoModels.length > 0) return monacoModels[0].getValue();
+                    if (cmView) return cmView.state.doc.toString();
+                    if (cmContent) return cmContent.innerText || '';
+                    if (target && 'value' in target) return target.value || '';
+                    if (target && target.isContentEditable) return target.innerText || '';
+                    return '';
                 }
-                if (action === 'insert' || action === 'paste' || action === 'set_code') {
-                    if (target.isContentEditable) {
-                        if (action === 'set_code') target.innerText = '';
-                        document.execCommand('insertText', false, rawText);
-                    } else {
-                        target.value = action === 'set_code' ? rawText : (target.value + rawText);
-                        target.dispatchEvent(new Event('input', { bubbles: true }));
+
+                function writeFullCode(newCode) {
+                    if (monacoModels.length > 0) {
+                        monacoModels[0].setValue(newCode);
+                        return 'monaco_model';
                     }
-                    return JSON.stringify({ status: 'ok', length: rawText.length });
+                    if (cmView) {
+                        cmView.dispatch({
+                            changes: { from: 0, to: cmView.state.doc.length, insert: newCode },
+                            selection: { anchor: newCode.length }
+                        });
+                        return 'codemirror6_dispatch';
+                    }
+                    if (target && window.__aiSetReactSafeValue) {
+                        return window.__aiSetReactSafeValue(target, newCode, newCode, false);
+                    }
+                    return 'none';
                 }
-                return JSON.stringify({ status: 'ok', content: (target.value || target.innerText || '') });
+
+                if (action === 'get_code' || action === 'copy') {
+                    const code = readCurrentCode();
+                    return JSON.stringify({ status: 'ok', action: action, length: code.length, content: code });
+                }
+
+                if (action === 'set_code') {
+                    const usedEngine = writeFullCode(rawText);
+                    const actual = readCurrentCode();
+                    return JSON.stringify({
+                        status: 'ok',
+                        engine: usedEngine,
+                        expected_length: rawText.length,
+                        actual_length: actual.length,
+                        preview: actual.slice(0, 120)
+                    });
+                }
+
+                if (action === 'clear') {
+                    const usedEngine = writeFullCode('');
+                    const actual = readCurrentCode();
+                    return JSON.stringify({
+                        status: 'cleared',
+                        engine: usedEngine,
+                        actual_length: actual.length
+                    });
+                }
+
+                if (action === 'insert' || action === 'paste') {
+                    let usedEngine = 'react_safe_insert';
+                    if (monacoEditors.length > 0 && monacoEditors[0].hasTextFocus && monacoEditors[0].hasTextFocus()) {
+                        monacoEditors[0].trigger('keyboard', 'type', { text: rawText });
+                        usedEngine = 'monaco_trigger';
+                    } else if (cmView) {
+                        const mainSel = cmView.state.selection.main;
+                        cmView.dispatch({
+                            changes: { from: mainSel.from, to: mainSel.to, insert: rawText },
+                            selection: { anchor: mainSel.from + rawText.length }
+                        });
+                        usedEngine = 'codemirror6_insert';
+                    } else if (target && window.__aiSetReactSafeValue) {
+                        usedEngine = window.__aiSetReactSafeValue(target, rawText, rawText, true);
+                    }
+                    const actual = readCurrentCode();
+                    return JSON.stringify({
+                        status: 'ok',
+                        engine: usedEngine,
+                        inserted_length: rawText.length,
+                        actual_length: actual.length,
+                        preview: actual.slice(0, 120)
+                    });
+                }
+
+                if (action === 'goto_line') {
+                    if (monacoEditors.length > 0) {
+                        monacoEditors[0].revealLineInCenter($line);
+                        monacoEditors[0].setPosition({ lineNumber: $line, column: 1 });
+                        return JSON.stringify({ status: 'moved', line: $line });
+                    }
+                    if (cmView) {
+                        const maxLines = cmView.state.doc.lines;
+                        const targetLine = Math.min(Math.max(1, $line), maxLines);
+                        const lineInfo = cmView.state.doc.line(targetLine);
+                        cmView.dispatch({ selection: { anchor: lineInfo.from }, scrollIntoView: true });
+                        return JSON.stringify({ status: 'moved', line: targetLine });
+                    }
+                }
+
+                return JSON.stringify({ status: 'ok', content: readCurrentCode() });
             })();
-        """.trimIndent())
+        """.trimIndent()
+        return evalJsSync(js)
     }
 
     private fun performSpecialKeySync(keyName: String): String {
@@ -1950,6 +2583,10 @@ class MainActivity : Activity() {
             "enter" -> KeyEvent.KEYCODE_ENTER
             "tab" -> KeyEvent.KEYCODE_TAB
             "escape", "esc" -> KeyEvent.KEYCODE_ESCAPE
+            "up", "arrowup" -> KeyEvent.KEYCODE_DPAD_UP
+            "down", "arrowdown" -> KeyEvent.KEYCODE_DPAD_DOWN
+            "left", "arrowleft" -> KeyEvent.KEYCODE_DPAD_LEFT
+            "right", "arrowright" -> KeyEvent.KEYCODE_DPAD_RIGHT
             else -> KeyEvent.KEYCODE_ENTER
         }
         runOnMainSync {
@@ -1963,6 +2600,10 @@ class MainActivity : Activity() {
         evalJsSync("""
             (function() {
                 let el = $elementId > 0 ? document.querySelector('[data-ai-id="$elementId"]') : null;
+                if (!el) {
+                    const modalCard = document.querySelector('#__ai_select_modal > div');
+                    el = modalCard || document.querySelector('.cm-scroller, .monaco-scrollable-element, .ace_scrollbar');
+                }
                 if (el) el.scrollBy({ left: $dx, top: $dy, behavior: 'smooth' });
                 else window.scrollBy({ left: $dx, top: $dy, behavior: 'smooth' });
             })();
