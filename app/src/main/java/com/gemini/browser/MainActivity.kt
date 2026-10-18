@@ -11,7 +11,6 @@ import android.content.SharedPreferences
 import android.graphics.*
 import android.net.Uri
 import android.os.*
-import android.text.TextUtils
 import android.text.method.ScrollingMovementMethod
 import android.util.Base64
 import android.util.TypedValue
@@ -64,7 +63,14 @@ class MainActivity : Activity() {
 
     private val tabs = CopyOnWriteArrayList<BrowserTab>()
     private val nextTabId = AtomicInteger(1)
+    private val domGeneration = AtomicInteger(1)
     @Volatile private var activeTab: BrowserTab? = null
+
+    // TinyFish Autonomous Goal State
+    @Volatile private var activeGoalDescription: String = "Autonomous Browser Task Execution"
+    @Volatile private var expectedTargetFilePath: String = ""
+    @Volatile private var expectedTargetContentLength: Int = 0
+    @Volatile private var expectedTargetContentSha256: String = ""
 
     private val webView: WebView
         get() = (activeTab ?: tabs.first()).webView
@@ -94,7 +100,6 @@ class MainActivity : Activity() {
 
     @Volatile private var queuedFilePath: String? = null
 
-    // Pure Chrome User-Agent (Bypasses Google Login "unauthorized/disallowed_useragent" error)
     private val mobileUA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
     private val desktopUA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
@@ -111,6 +116,11 @@ class MainActivity : Activity() {
         activeInstance = this
         prefs = getSharedPreferences("gemini_browser_prefs", Context.MODE_PRIVATE)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
+        // Enable Chromium DevTools Protocol (CDP) for Playwright / remote inspection
+        try {
+            WebView.setWebContentsDebuggingEnabled(true)
+        } catch (_: Exception) {}
 
         try {
             val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
@@ -137,6 +147,12 @@ class MainActivity : Activity() {
             value.toFloat(),
             resources.displayMetrics
         ).toInt()
+    }
+
+    private fun sha256Hex(text: String): String {
+        return MessageDigest.getInstance("SHA-256")
+            .digest(text.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
     }
 
     private fun makePanelButton(label: String, bgHex: String, widthDp: Int = 78, onClick: () -> Unit): Button {
@@ -168,7 +184,6 @@ class MainActivity : Activity() {
             )
         }
 
-        // 1. Horizontally Scrollable Multi-Tab Bar
         val tabBarScroll = HorizontalScrollView(this).apply {
             isHorizontalScrollBarEnabled = false
             overScrollMode = View.OVER_SCROLL_ALWAYS
@@ -190,7 +205,6 @@ class MainActivity : Activity() {
         }
         tabBarScroll.addView(tabBarContainer)
 
-        // 2. Navigation Bar
         val navBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -238,7 +252,6 @@ class MainActivity : Activity() {
         navBar.addView(btnGo)
         navBar.addView(desktopBtn)
 
-        // 3. Horizontally Draggable/Scrollable Action Panel
         val consoleScroll = HorizontalScrollView(this).apply {
             isHorizontalScrollBarEnabled = false
             isFillViewport = false
@@ -266,7 +279,7 @@ class MainActivity : Activity() {
                 val arrStr = extractDomSync(true)
                 try {
                     val arr = JSONArray(arrStr)
-                    setConsoleStatus("🟢 DOM Elements: ${arr.length()}", false)
+                    setConsoleStatus("🟢 DOM Gen #${domGeneration.get()}: ${arr.length()} items", false)
                 } catch (_: Exception) {}
             }
         }
@@ -278,9 +291,8 @@ class MainActivity : Activity() {
                 try {
                     val obj = JSONObject(resStr)
                     val blocks = obj.optJSONArray("ocr_blocks")?.length() ?: 0
-                    val errs = obj.optJSONArray("errors_detected")?.length() ?: 0
-                    setConsoleStatus("🟢 OCR: $blocks | Err: $errs", errs > 0)
-                    appendLog("OCR Done: $blocks blocks, $errs errors")
+                    setConsoleStatus("🟢 OCR Blocks: $blocks", false)
+                    appendLog("OCR Done: $blocks blocks")
                 } catch (_: Exception) {}
             }
         }
@@ -293,8 +305,8 @@ class MainActivity : Activity() {
                     val vObj = JSONObject(vStr)
                     val sha = vObj.optString("commit_sha", "").take(7)
                     val path = vObj.optString("file_path", "")
-                    val runSt = vObj.optString("actions_run_status", "")
-                    val summary = "SHA:${sha.ifEmpty { "N/A" }} | Path:${path.ifEmpty { "N/A" }} | Run:${runSt.ifEmpty { "N/A" }}"
+                    val len = vObj.optInt("committed_content_length", vObj.optInt("editor_length", 0))
+                    val summary = "SHA:${sha.ifEmpty { "N/A" }} | Path:${path.ifEmpty { "N/A" }} | Len:$len"
                     setConsoleStatus("🟢 $summary", false)
                     appendLog("VERIFY -> $summary")
                 } catch (_: Exception) {}
@@ -341,7 +353,6 @@ class MainActivity : Activity() {
         consoleRow.addView(consoleText)
         consoleScroll.addView(consoleRow)
 
-        // 4. WebView Container + Multi-Tab Holder + AI Overlay
         webContainer = FrameLayout(this).apply {
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -386,7 +397,7 @@ class MainActivity : Activity() {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 dp(110)
             )
-            text = "[System] Gemini Multi-Tab Browser Ready on port $SERVER_PORT...\n"
+            text = "[System] Gemini Autonomous Browser Ready on port $SERVER_PORT (CDP Enabled)...\n"
         }
 
         root.addView(tabBarScroll)
@@ -398,25 +409,499 @@ class MainActivity : Activity() {
         setContentView(root)
     }
 
-    // ==================== STEP 6: ACTUAL GITHUB COMMIT & ACTIONS VERIFIER ====================
+    // ==================== IMPROVEMENT 3 & 7: GITHUB STATE INSPECTOR & TINYFISH DIRECTIVE ENGINE ====================
+
+    private fun inspectGitHubPageStateSync(): JSONObject {
+        val js = """
+            (function() {
+                const url = window.location.href || '';
+                const pathName = window.location.pathname || '';
+                const isNewOrEdit = /\/(new|edit)\//.test(pathName);
+
+                // 1. Reconstruct Effective File Path (Breadcrumb directories + File name input)
+                const crumbParts = [];
+                document.querySelectorAll(
+                    '[data-testid="breadcrumbs"] a, [data-testid="breadcrumbs-filename"], .js-path-segment a, .breadcrumb a'
+                ).forEach(el => {
+                    const t = (el.innerText || el.textContent || '').replace(/\//g, '').trim();
+                    if (t) crumbParts.push(t);
+                });
+                // Remove repository name if it is the first breadcrumb
+                const repoParts = pathName.split('/').filter(Boolean);
+                if (crumbParts.length > 0 && repoParts.length >= 2 && crumbParts[0].toLowerCase() === repoParts[1].toLowerCase()) {
+                    crumbParts.shift();
+                }
+
+                const fnInput = document.querySelector(
+                    'input[aria-label*="file name" i], input[placeholder*="Name your file" i], input.js-blob-filename, input[name="filename"]'
+                );
+                const fnVal = fnInput ? (fnInput.value || '').trim() : '';
+
+                let effectivePath = '';
+                if (isNewOrEdit) {
+                    const combined = [...crumbParts];
+                    if (fnVal) combined.push(fnVal);
+                    effectivePath = combined.join('/').replace(/\/+/g, '/');
+                } else {
+                    const m = pathName.match(/^\/[^\/]+\/[^\/]+\/(?:blob|raw|tree)\/[^\/]+\/(.+)$/);
+                    if (m) effectivePath = decodeURIComponent(m[1]);
+                }
+
+                // 2. Read Editor Content (CodeMirror 6 / Monaco / Textarea)
+                let editorContent = '';
+                let editorEngine = 'none';
+
+                function findCmView() {
+                    const nodes = document.querySelectorAll('.cm-editor, .cm-content, .cm-scroller, .cm-line');
+                    for (let i = 0; i < nodes.length; i++) {
+                        const n = nodes[i];
+                        const cv = n.cmView || n.cmTile;
+                        if (cv) {
+                            if (cv.view && cv.view.state && cv.view.state.doc) return cv.view;
+                            if (cv.rootView && cv.rootView.view && cv.rootView.view.state) return cv.rootView.view;
+                            if (cv.root && cv.root.view && cv.root.view.state) return cv.root.view;
+                            for (const k of Object.keys(cv)) {
+                                const v = cv[k];
+                                if (v && typeof v === 'object' && v.state && v.state.doc && typeof v.dispatch === 'function') return v;
+                                if (v && typeof v === 'object' && v.view && v.view.state && v.view.state.doc) return v.view;
+                            }
+                        }
+                    }
+                    return null;
+                }
+
+                const cmView = findCmView();
+                const cmContent = document.querySelector('.cm-content[contenteditable="true"]');
+                if (cmView) {
+                    editorContent = cmView.state.doc.toString();
+                    editorEngine = 'codemirror6_state';
+                } else if (window.monaco && window.monaco.editor && window.monaco.editor.getModels && window.monaco.editor.getModels().length > 0) {
+                    editorContent = window.monaco.editor.getModels()[0].getValue();
+                    editorEngine = 'monaco_model';
+                } else if (cmContent) {
+                    const lines = cmContent.querySelectorAll('.cm-line');
+                    if (lines.length > 0) {
+                        const arr = [];
+                        lines.forEach(l => arr.push((l.innerText || l.textContent || '').replace(/\u200B/g, '').replace(/\r?\n/g, '')));
+                        editorContent = arr.join('\n');
+                    } else {
+                        editorContent = cmContent.innerText || '';
+                    }
+                    editorEngine = 'codemirror_dom_lines';
+                }
+
+                // 3. Detect Open Modal Dialog (e.g. "Commit changes" modal)
+                const openDialogs = Array.from(document.querySelectorAll('[role="dialog"], dialog[open], .Overlay, .Box-overlay'))
+                    .filter(d => {
+                        const r = d.getBoundingClientRect();
+                        const s = window.getComputedStyle(d);
+                        return r.width > 50 && r.height > 50 && s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
+                    });
+                const hasOpenDialog = openDialogs.length > 0;
+                let dialogTitle = '';
+                let dialogCommitBtnId = -1;
+                if (hasOpenDialog) {
+                    const d = openDialogs[openDialogs.length - 1];
+                    const h = d.querySelector('h1, h2, h3, [id*="dialog-title"], .Box-title');
+                    dialogTitle = h ? (h.innerText || '').trim() : 'Modal Dialog';
+                    const btns = d.querySelectorAll('button, [role="button"]');
+                    btns.forEach(b => {
+                        const t = (b.innerText || b.textContent || '').trim().toLowerCase();
+                        if ((t === 'commit changes' || t.includes('commit')) && !b.disabled && b.getAttribute('aria-disabled') !== 'true') {
+                            const aid = parseInt(b.getAttribute('data-ai-id') || '-1', 10);
+                            if (aid > 0) dialogCommitBtnId = aid;
+                        }
+                    });
+                }
+
+                // 4. Check Main Page "Commit changes..." Trigger Button
+                let topCommitBtnId = -1;
+                let topCommitBtnEnabled = false;
+                document.querySelectorAll('button, [role="button"]').forEach(b => {
+                    const t = (b.innerText || b.textContent || '').trim().toLowerCase();
+                    if (t === 'commit changes...' || t === 'commit changes') {
+                        const inDlg = b.closest('[role="dialog"], dialog[open], .Overlay') !== null;
+                        if (!inDlg) {
+                            topCommitBtnId = parseInt(b.getAttribute('data-ai-id') || '-1', 10);
+                            topCommitBtnEnabled = !b.disabled && b.getAttribute('aria-disabled') !== 'true';
+                        }
+                    }
+                });
+
+                // 5. Latest Commit SHA if on committed blob/repo page
+                let commitSha = '';
+                const urlShaMatch = pathName.match(/\/(?:commit|blob|tree)\/([0-9a-f]{7,40})/i);
+                if (urlShaMatch) commitSha = urlShaMatch[1];
+                if (!commitSha) {
+                    const shaEl = document.querySelector('a[href*="/commit/"], span.sha, meta[name="octolytics-dimension-repository_network_root_sha"]');
+                    if (shaEl) {
+                        const href = shaEl.getAttribute('href') || '';
+                        const m = href.match(/\/commit\/([0-9a-f]{7,40})/i);
+                        commitSha = m ? m[1] : (shaEl.getAttribute('content') || shaEl.innerText || '').trim();
+                    }
+                }
+
+                return JSON.stringify({
+                    url: url,
+                    is_in_editor: isNewOrEdit,
+                    breadcrumb_segments: crumbParts,
+                    filename_input_value: fnVal,
+                    filename_input_id: fnInput ? parseInt(fnInput.getAttribute('data-ai-id') || '-1', 10) : -1,
+                    effective_full_path: effectivePath,
+                    editor_engine: editorEngine,
+                    editor_length: editorContent.length,
+                    editor_lines_count: editorContent ? editorContent.split('\n').length : 0,
+                    editor_preview: editorContent.slice(0, 200),
+                    has_open_dialog: hasOpenDialog,
+                    dialog_title: dialogTitle,
+                    dialog_commit_button_id: dialogCommitBtnId,
+                    page_commit_button_id: topCommitBtnId,
+                    page_commit_button_enabled: topCommitBtnEnabled,
+                    commit_sha: commitSha
+                });
+            })();
+        """.trimIndent()
+
+        val raw = evalJsSync(js)
+        return try {
+            if (raw.startsWith("{")) JSONObject(raw) else JSONObject()
+        } catch (_: Exception) {
+            JSONObject()
+        }
+    }
+
+    // Builds the TinyFish-style Autonomous Supervisor Directive + Fresh Page State after EVERY action
+    private fun attachFreshStateAndDirective(baseResponse: JSONObject, actionName: String): String {
+        val currentGen = domGeneration.incrementAndGet()
+        val domStr = extractDomSync(false)
+        val domArr = try { if (domStr.startsWith("[")) JSONArray(domStr) else JSONArray() } catch (_: Exception) { JSONArray() }
+        val ghState = inspectGitHubPageStateSync()
+
+        // Filter priority elements (if a dialog is open, surface dialog elements at the top!)
+        val hasDialog = ghState.optBoolean("has_open_dialog", false)
+        val priorityElements = JSONArray()
+        for (i in 0 until domArr.length()) {
+            val item = domArr.getJSONObject(i)
+            if (hasDialog && item.optBoolean("in_open_dialog", false)) {
+                priorityElements.put(item)
+            } else if (!hasDialog && priorityElements.length() < 35) {
+                priorityElements.put(item)
+            }
+        }
+
+        // Construct TinyFish Autonomous Directive
+        val directive = JSONObject()
+        directive.put("mode", "TINYFISH_AUTONOMOUS_SUPERVISOR")
+        directive.put("active_goal", activeGoalDescription)
+        directive.put("dom_generation", currentGen)
+
+        val isEditor = ghState.optBoolean("is_in_editor", false)
+        val effPath = ghState.optString("effective_full_path", "")
+        val edLen = ghState.optInt("editor_length", 0)
+        val dlgCommitId = ghState.optInt("dialog_commit_button_id", -1)
+        val pageCommitId = ghState.optInt("page_commit_button_id", -1)
+        val pageCommitEnabled = ghState.optBoolean("page_commit_button_enabled", false)
+        val fnInputId = ghState.optInt("filename_input_id", -1)
+
+        if (isEditor) {
+            val pathMatches = expectedTargetFilePath.isEmpty() || effPath.equals(expectedTargetFilePath, ignoreCase = true)
+            val contentMatches = if (expectedTargetContentLength > 0) {
+                kotlin.math.abs(edLen - expectedTargetContentLength) <= 5
+            } else {
+                edLen > 40
+            }
+
+            if (effPath.isEmpty() || !pathMatches) {
+                directive.put("directive_status", "CONTINUE_IMMEDIATELY")
+                directive.put("detected_stage", "STEP_1_SET_FILE_PATH")
+                directive.put(
+                    "supervisor_instruction",
+                    "⚡ [BROWSER DIRECTIVE]: File path is currently '$effPath' (expected: '${expectedTargetFilePath.ifEmpty { "target path" }}'). Call POST /set_github_path or POST /type on element_id=$fnInputId immediately. Do NOT stop!"
+                )
+                directive.put(
+                    "suggested_next_call",
+                    JSONObject()
+                        .put("endpoint", "/set_github_path")
+                        .put("body", JSONObject().put("path", expectedTargetFilePath.ifEmpty { ".github/workflows/url-audit.yml" }))
+                )
+            } else if (!contentMatches) {
+                directive.put("directive_status", "FIX_REQUIRED_CONTINUE")
+                directive.put("detected_stage", "STEP_2_SET_AND_VERIFY_EDITOR_CODE")
+                directive.put(
+                    "supervisor_instruction",
+                    "⚠️ [BROWSER DIRECTIVE]: Path '$effPath' is set, BUT editor content length is $edLen chars (expected: ${if (expectedTargetContentLength > 0) expectedTargetContentLength else ">40"}). Do NOT click Commit yet! Call POST /editor with action='set_code' and text_b64, and verify exact_match==true."
+                )
+                directive.put(
+                    "suggested_next_call",
+                    JSONObject()
+                        .put("endpoint", "/editor")
+                        .put("body", JSONObject().put("action", "set_code").put("text_b64", "<BASE64_CONTENT>"))
+                )
+            } else if (hasDialog) {
+                directive.put("directive_status", "CONTINUE_IMMEDIATELY")
+                directive.put("detected_stage", "STEP_4_CONFIRM_COMMIT_IN_DIALOG")
+                directive.put(
+                    "supervisor_instruction",
+                    "⚡ [BROWSER DIRECTIVE]: Commit dialog '${ghState.optString("dialog_title")}' is OPEN! Path '$effPath' and Editor ($edLen chars) are verified. Now click the dialog's primary 'Commit changes' button (element_id=$dlgCommitId, context='dialog') and then call POST /verify!"
+                )
+                directive.put(
+                    "suggested_next_call",
+                    JSONObject()
+                        .put("endpoint", "/click")
+                        .put("body", JSONObject().put("element_id", dlgCommitId).put("text", "Commit changes").put("context", "dialog"))
+                )
+            } else {
+                directive.put("directive_status", "CONTINUE_IMMEDIATELY")
+                directive.put("detected_stage", "STEP_3_OPEN_COMMIT_DIALOG")
+                directive.put(
+                    "supervisor_instruction",
+                    "⚡ [BROWSER DIRECTIVE]: Both Path ('$effPath') and Editor Content ($edLen chars) are verified! Commit button enabled=$pageCommitEnabled. Click 'Commit changes...' (element_id=$pageCommitId) now!"
+                )
+                directive.put(
+                    "suggested_next_call",
+                    JSONObject()
+                        .put("endpoint", "/click")
+                        .put("body", JSONObject().put("element_id", pageCommitId).put("text", "Commit changes..."))
+                )
+            }
+        } else if (currentUrl.contains("github.com") && (currentUrl.contains("/blob/") || currentUrl.contains("/tree/"))) {
+            directive.put("directive_status", "CONTINUE_IMMEDIATELY")
+            directive.put("detected_stage", "STEP_5_VERIFY_COMMIT_AND_ACTIONS")
+            directive.put(
+                "supervisor_instruction",
+                "⚡ [BROWSER DIRECTIVE]: Editor is closed and page is at '$currentUrl' (SHA: ${ghState.optString("commit_sha").take(7)}). Call POST /verify now to confirm actual committed file path, content, and Actions run status!"
+            )
+            directive.put(
+                "suggested_next_call",
+                JSONObject().put("endpoint", "/verify").put("body", JSONObject().put("expected_path", expectedTargetFilePath))
+            )
+        } else {
+            directive.put("directive_status", "CONTINUE_IMMEDIATELY")
+            directive.put("detected_stage", "ACTIVE_NAVIGATION_OR_INTERACTION")
+            directive.put(
+                "supervisor_instruction",
+                "⚡ [BROWSER DIRECTIVE]: Action '$actionName' completed on DOM Gen #$currentGen. Inspect 'fresh_page_state' below and execute the next step toward your goal immediately without pausing!"
+            )
+        }
+
+        baseResponse.put("dom_generation", currentGen)
+        baseResponse.put("github_state", ghState)
+        baseResponse.put("fresh_page_state", JSONObject()
+            .put("url", currentUrl)
+            .put("title", currentTitle)
+            .put("has_open_dialog", hasDialog)
+            .put("interactive_elements_count", domArr.length())
+            .put("priority_elements", priorityElements)
+        )
+        baseResponse.put("agent_directive", directive)
+        return baseResponse.toString()
+    }
+
+    // ==================== IMPROVEMENT 3B: DEDICATED GITHUB PATH SETTER ====================
+
+    private fun performSetGitHubPathSync(targetPath: String): String {
+        val cleanPath = targetPath.trim().removePrefix("/")
+        expectedTargetFilePath = cleanPath
+
+        // 1. Focus the filename input and clear any existing breadcrumb segments with Backspace if needed
+        val prepJs = """
+            (function() {
+                const fnInput = document.querySelector(
+                    'input[aria-label*="file name" i], input[placeholder*="Name your file" i], input.js-blob-filename, input[name="filename"]'
+                );
+                if (!fnInput) return 'no_input';
+                fnInput.scrollIntoView({ behavior: 'instant', block: 'center' });
+                fnInput.focus();
+                if (window.__aiSetReactSafeValue) {
+                    window.__aiSetReactSafeValue(fnInput, '', '', false);
+                } else {
+                    fnInput.value = '';
+                    fnInput.dispatchEvent(new Event('input', { bubbles: true }));
+                }
+                return 'ready';
+            })();
+        """.trimIndent()
+
+        val status = evalJsSync(prepJs)
+        if (status == "no_input") {
+            return attachFreshStateAndDirective(
+                JSONObject().put("status", "error").put("message", "GitHub filename input not found on current page"),
+                "set_github_path"
+            )
+        }
+
+        // Send a few Backspaces in case old breadcrumb segments exist
+        for (i in 0..5) {
+            val gh = inspectGitHubPageStateSync()
+            val crumbs = gh.optJSONArray("breadcrumb_segments")?.length() ?: 0
+            if (crumbs == 0) break
+            performSpecialKeySync("Backspace")
+            Thread.sleep(60)
+        }
+
+        // Type path segment by segment so GitHub's `/` breadcrumb splitter processes each directory cleanly
+        for (ch in cleanPath) {
+            val s = ch.toString().replace("\\", "\\\\").replace("'", "\\'")
+            evalJsSync("""
+                (function() {
+                    const fnInput = document.querySelector(
+                        'input[aria-label*="file name" i], input[placeholder*="Name your file" i], input.js-blob-filename, input[name="filename"]'
+                    );
+                    if (!fnInput) return;
+                    fnInput.focus();
+                    fnInput.dispatchEvent(new KeyboardEvent('keydown', { key: '$s', bubbles: true, cancelable: true }));
+                    if (window.__aiSetReactSafeValue) {
+                        window.__aiSetReactSafeValue(fnInput, null, '$s', true);
+                    }
+                    fnInput.dispatchEvent(new KeyboardEvent('keyup', { key: '$s', bubbles: true }));
+                })();
+            """.trimIndent())
+            Thread.sleep(if (ch == '/') 120L else 25L)
+        }
+
+        Thread.sleep(200)
+        val afterState = inspectGitHubPageStateSync()
+        val actualFullPath = afterState.optString("effective_full_path", "")
+        val verified = actualFullPath.equals(cleanPath, ignoreCase = true)
+
+        val res = JSONObject()
+            .put("status", if (verified) "path_verified" else "path_mismatch")
+            .put("expected_path", cleanPath)
+            .put("effective_full_path", actualFullPath)
+            .put("verified", verified)
+        return attachFreshStateAndDirective(res, "set_github_path")
+    }
+
+    // ==================== IMPROVEMENT 6: PLAYWRIGHT-STYLE SEMANTIC LOCATOR ENGINE ====================
+
+    private fun performPlaywrightLocatorSync(body: JSONObject): String {
+        val action = body.optString("action", "click").lowercase(Locale.ROOT)
+        val role = body.optString("role", "")
+        val text = body.optString("text", body.optString("name", ""))
+        val label = body.optString("label", "")
+        val placeholder = body.optString("placeholder", "")
+        val selector = body.optString("selector", "")
+        val contextFilter = body.optString("context", "") // e.g. "dialog"
+        val exact = body.optBoolean("exact", false)
+        val timeoutMs = body.optLong("timeout_ms", 5000L)
+
+        val b64Val = body.optString("text_b64", "")
+        val fillValue = if (b64Val.isNotEmpty()) {
+            try { String(Base64.decode(b64Val, Base64.DEFAULT), Charsets.UTF_8) } catch (_: Exception) { "" }
+        } else {
+            body.optString("value", "")
+        }
+
+        val start = System.currentTimeMillis()
+        var matchedId = -1
+        var matchedInfo = JSONObject()
+
+        while (System.currentTimeMillis() - start < timeoutMs) {
+            extractDomSync(false)
+            val safeRole = role.replace("'", "\\'").lowercase(Locale.ROOT)
+            val safeText = text.replace("'", "\\'").lowercase(Locale.ROOT)
+            val safeLabel = label.replace("'", "\\'").lowercase(Locale.ROOT)
+            val safePh = placeholder.replace("'", "\\'").lowercase(Locale.ROOT)
+            val safeSel = selector.replace("'", "\\'")
+            val safeCtx = contextFilter.replace("'", "\\'").lowercase(Locale.ROOT)
+
+            val locateJs = """
+                (function() {
+                    const candidates = Array.from(document.querySelectorAll('[data-ai-id]'));
+                    const scored = [];
+                    for (const el of candidates) {
+                        const r = el.getBoundingClientRect();
+                        const s = window.getComputedStyle(el);
+                        if (r.width <= 4 || r.height <= 4 || s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') continue;
+                        if (el.disabled || el.getAttribute('aria-disabled') === 'true') continue;
+
+                        if ('$safeSel' && !el.matches('$safeSel')) continue;
+
+                        const elRole = (el.getAttribute('role') || el.tagName).toLowerCase();
+                        const elText = (el.innerText || el.value || el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                        const elAria = (el.getAttribute('aria-label') || '').trim().toLowerCase();
+                        const elPh = (el.getAttribute('placeholder') || '').trim().toLowerCase();
+                        const inDialog = el.closest('[role="dialog"], dialog[open], .Overlay, .Box-overlay') !== null;
+                        const elCtx = inDialog ? 'dialog' : 'main';
+
+                        if ('$safeCtx' && elCtx !== '$safeCtx') continue;
+                        if ('$safeRole' && !elRole.includes('$safeRole')) continue;
+                        if ('$safeLabel' && !elAria.includes('$safeLabel') && !elText.includes('$safeLabel')) continue;
+                        if ('$safePh' && !elPh.includes('$safePh')) continue;
+
+                        if ('$safeText') {
+                            const exactMatch = (elText === '$safeText' || elAria === '$safeText');
+                            const partialMatch = (elText.includes('$safeText') || elAria.includes('$safeText'));
+                            if ($exact && !exactMatch) continue;
+                            if (!partialMatch) continue;
+                        }
+
+                        // Priority score: elements inside open modal dialogs & exact text matches win!
+                        let score = 10;
+                        if (inDialog) score += 100;
+                        if ('$safeText' && (elText === '$safeText' || elAria === '$safeText')) score += 50;
+                        if (el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') score += 20;
+
+                        scored.push({
+                            id: parseInt(el.getAttribute('data-ai-id'), 10),
+                            score: score,
+                            tag: el.tagName.toLowerCase(),
+                            text: elText.slice(0, 100),
+                            in_dialog: inDialog
+                        });
+                    }
+                    scored.sort((a, b) => b.score - a.score);
+                    return scored.length > 0 ? JSON.stringify(scored[0]) : '';
+                })();
+            """.trimIndent()
+
+            val foundStr = evalJsSync(locateJs)
+            if (foundStr.startsWith("{")) {
+                matchedInfo = JSONObject(foundStr)
+                matchedId = matchedInfo.optInt("id", -1)
+                if (matchedId > 0) break
+            }
+            Thread.sleep(200)
+        }
+
+        if (matchedId <= 0) {
+            return attachFreshStateAndDirective(
+                JSONObject()
+                    .put("status", "locator_timeout")
+                    .put("role", role)
+                    .put("text", text)
+                    .put("label", label),
+                "locator"
+            )
+        }
+
+        return when (action) {
+            "click" -> performSmartClickSync(matchedId, -1f, -1f, "")
+            "fill", "type" -> performHumanTypingSync(matchedId, fillValue, clear = true, submit = false, instant = true)
+            else -> attachFreshStateAndDirective(
+                JSONObject().put("status", "located").put("matched", matchedInfo),
+                "locator"
+            )
+        }
+    }
+
+    // ==================== IMPROVEMENT 5: REAL COMMIT & ACTIONS VERIFIER ====================
 
     private fun performGitHubVerificationSync(body: JSONObject?): String {
-        val expectedPath = body?.optString("expected_path", body.optString("path", "")) ?: ""
+        val expectedPath = body?.optString("expected_path", body.optString("path", expectedTargetFilePath)) ?: expectedTargetFilePath
         val expectedText = body?.optString("expected_content", body.optString("contains", "")) ?: ""
+        val expectedLen = body?.optInt("expected_length", expectedTargetContentLength) ?: expectedTargetContentLength
         val repoParam = body?.optString("repo", "") ?: ""
         val tokenParam = body?.optString("token", "") ?: ""
 
-        // 1. Deep DOM Verification on Current Browser Page (Commit SHA, File Path, File Content, Actions Run & Logs)
         val domVerifyJs = """
             (function() {
                 const url = window.location.href || '';
                 const pathName = window.location.pathname || '';
 
-                // Detect if still stuck in uncommitted editor mode
                 const isEditorOpen = /\/(edit|new)\//.test(pathName) ||
                     document.querySelector('.cm-content[contenteditable="true"], .monaco-editor textarea.inputarea') !== null;
 
-                // Extract Commit SHA from URL, meta tags, or commit links
                 let commitSha = '';
                 const urlShaMatch = pathName.match(/\/(?:commit|blob|tree)\/([0-9a-f]{7,40})/i);
                 if (urlShaMatch) commitSha = urlShaMatch[1];
@@ -432,7 +917,6 @@ class MainActivity : Activity() {
                     }
                 }
 
-                // Extract Committed File Path from URL or Breadcrumbs
                 let filePath = '';
                 const blobMatch = pathName.match(/^\/[^\/]+\/[^\/]+\/(?:blob|edit|raw)\/[^\/]+\/(.+)$/);
                 if (blobMatch) {
@@ -449,19 +933,17 @@ class MainActivity : Activity() {
                     }
                 }
 
-                // Extract Committed File Content (Read-Only Blob View)
                 let committedLines = [];
-                const reactLines = document.querySelectorAll('.react-code-text, .blob-code-inner, [data-testid="read-only-cursor-text-area"]');
-                if (reactLines.length === 1 && reactLines[0].tagName === 'TEXTAREA') {
-                    committedLines = (reactLines[0].value || '').split('\n');
-                } else if (reactLines.length > 0) {
+                const roTextarea = document.querySelector('[data-testid="read-only-cursor-text-area"]');
+                if (roTextarea && roTextarea.value) {
+                    committedLines = roTextarea.value.split('\n');
+                } else {
+                    const reactLines = document.querySelectorAll('.react-code-text, .blob-code-inner');
                     reactLines.forEach(l => committedLines.push(l.innerText || l.textContent || ''));
                 }
                 const committedContent = committedLines.join('\n');
 
-                // Extract GitHub Actions Workflow Run Status, Steps & Error Logs
                 let actionsRunStatus = '';
-                let actionsConclusion = '';
                 const statusBadge = document.querySelector('[data-testid="status-badge"], .State, [aria-label*="workflow run" i]');
                 if (statusBadge) {
                     actionsRunStatus = (statusBadge.innerText || statusBadge.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
@@ -490,13 +972,6 @@ class MainActivity : Activity() {
                     }
                 });
 
-                // Flash banner or commit error alert check
-                let githubErrorBanner = '';
-                const flashErr = document.querySelector('.flash-error, [role="alert"].flash-error, .js-flash-alert');
-                if (flashErr) {
-                    githubErrorBanner = (flashErr.innerText || '').replace(/\s+/g, ' ').trim();
-                }
-
                 return JSON.stringify({
                     url: url,
                     is_still_in_editor: isEditorOpen,
@@ -505,8 +980,7 @@ class MainActivity : Activity() {
                     committed_lines_count: committedLines.length,
                     committed_content_length: committedContent.length,
                     committed_content_preview: committedContent.slice(0, 500),
-                    committed_content_full: committedContent.slice(0, 15000),
-                    github_error_banner: githubErrorBanner,
+                    committed_content_full: committedContent.slice(0, 20000),
                     actions_run_status: actionsRunStatus,
                     actions_steps: stepSummaries.slice(0, 30),
                     actions_failed_steps: failedSteps,
@@ -534,12 +1008,14 @@ class MainActivity : Activity() {
         if (expectedText.isNotEmpty() && !domContent.contains(expectedText)) {
             verified = false
         }
+        if (expectedLen > 0 && domContent.isNotEmpty() && kotlin.math.abs(domContent.length - expectedLen) > 20) {
+            verified = false
+        }
 
         resultObj.remove("committed_content_full")
         resultObj.put("status", if (verified) "verified_success" else "unverified_or_pending")
         resultObj.put("commit_verified", verified)
 
-        // 2. Optional Direct GitHub REST API Verification if "repo" is passed in /verify request
         if (repoParam.isNotEmpty() && repoParam.contains("/")) {
             try {
                 val apiVerification = verifyViaGitHubRestApi(repoParam, expectedPath, expectedText, tokenParam)
@@ -549,7 +1025,7 @@ class MainActivity : Activity() {
             }
         }
 
-        return resultObj.toString()
+        return attachFreshStateAndDirective(resultObj, "verify")
     }
 
     private fun verifyViaGitHubRestApi(repo: String, path: String, expectedSubstring: String, token: String): JSONObject {
@@ -566,7 +1042,6 @@ class MainActivity : Activity() {
             return conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
         }
 
-        // Latest Commit SHA
         val commitsRaw = getJson("https://api.github.com/repos/$repo/commits?per_page=1")
         val commitsArr = JSONArray(commitsRaw)
         if (commitsArr.length() > 0) {
@@ -581,19 +1056,15 @@ class MainActivity : Activity() {
                 val fileObj = JSONObject(fileRaw)
                 val b64Content = fileObj.optString("content", "").replace("\n", "").replace("\r", "")
                 val decoded = String(Base64.decode(b64Content, Base64.DEFAULT), Charsets.UTF_8)
-                val sha256 = MessageDigest.getInstance("SHA-256").digest(decoded.toByteArray(Charsets.UTF_8))
-                    .joinToString("") { "%02x".format(it) }
-
                 out.put("verified_file_path", fileObj.optString("path", path))
                 out.put("verified_file_size", decoded.length)
-                out.put("verified_file_sha256", sha256)
+                out.put("verified_file_sha256", sha256Hex(decoded))
                 if (expectedSubstring.isNotEmpty()) {
                     out.put("content_matches_expected", decoded.contains(expectedSubstring))
                 }
             }
         }
 
-        // Latest Workflow Run & Jobs
         val runsRaw = getJson("https://api.github.com/repos/$repo/actions/runs?per_page=1")
         val runsArr = JSONObject(runsRaw).optJSONArray("workflow_runs")
         if (runsArr != null && runsArr.length() > 0) {
@@ -603,31 +1074,11 @@ class MainActivity : Activity() {
             out.put("workflow_head_sha", run.optString("head_sha", ""))
             out.put("workflow_status", run.optString("status", ""))
             out.put("workflow_conclusion", run.optString("conclusion", ""))
-
-            if (runId > 0L) {
-                val jobsRaw = getJson("https://api.github.com/repos/$repo/actions/runs/$runId/jobs")
-                val jobsArr = JSONObject(jobsRaw).optJSONArray("jobs") ?: JSONArray()
-                val stepsReport = JSONArray()
-                for (j in 0 until jobsArr.length()) {
-                    val job = jobsArr.getJSONObject(j)
-                    val steps = job.optJSONArray("steps") ?: JSONArray()
-                    for (s in 0 until steps.length()) {
-                        val st = steps.getJSONObject(s)
-                        stepsReport.put(
-                            JSONObject()
-                                .put("name", st.optString("name", ""))
-                                .put("status", st.optString("status", ""))
-                                .put("conclusion", st.optString("conclusion", ""))
-                        )
-                    }
-                }
-                out.put("job_steps", stepsReport)
-            }
         }
         return out
     }
 
-    // ==================== MULTI-TAB ENGINE (UI + AI CAPABILITY) ====================
+    // ==================== MULTI-TAB ENGINE ====================
 
     private fun createNewTab(initialUrl: String = "https://gemini.google.com", switchToIt: Boolean = true): BrowserTab {
         val id = nextTabId.getAndIncrement()
@@ -673,17 +1124,15 @@ class MainActivity : Activity() {
         overlayView.clearHighlights()
         refreshTabBarUi()
         setConsoleStatus("🟢 127.0.0.1:$SERVER_PORT | Active Tab #${targetTab.id}", false)
-        appendLog("🔄 Switched to Tab #${targetTab.id} (${targetTab.title.take(20)})")
+        appendLog("🔄 Switched to Tab #${targetTab.id}")
         broadcastSse("tab_switched", JSONObject().put("tab_id", targetTab.id).put("url", targetTab.url).toString())
     }
 
     private fun closeTab(targetTab: BrowserTab) {
         if (tabs.size <= 1) {
             targetTab.webView.loadUrl("https://gemini.google.com")
-            Toast.makeText(this, "Reset Tab #${targetTab.id}", Toast.LENGTH_SHORT).show()
             return
         }
-
         val idx = tabs.indexOf(targetTab)
         val wasActive = (activeTab?.id == targetTab.id)
         tabs.remove(targetTab)
@@ -693,24 +1142,16 @@ class MainActivity : Activity() {
             targetTab.webView.destroy()
         } catch (_: Exception) {}
 
-        appendLog("✕ Closed Tab #${targetTab.id}")
-        broadcastSse("tab_closed", targetTab.id.toString())
-
         if (wasActive && tabs.isNotEmpty()) {
-            val nextIdx = idx.coerceIn(0, tabs.size - 1)
-            switchToTab(tabs[nextIdx])
+            switchToTab(tabs[idx.coerceIn(0, tabs.size - 1)])
         } else {
             refreshTabBarUi()
         }
     }
 
     private fun findTabByQuery(tabId: Int = -1, index: Int = -1, query: String = ""): BrowserTab? {
-        if (tabId > 0) {
-            tabs.find { it.id == tabId }?.let { return it }
-        }
-        if (index in 0 until tabs.size) {
-            return tabs[index]
-        }
+        if (tabId > 0) tabs.find { it.id == tabId }?.let { return it }
+        if (index in 0 until tabs.size) return tabs[index]
         if (query.isNotBlank()) {
             val q = query.trim().lowercase(Locale.ROOT)
             val numMatch = Regex("(?:tab\\s*#?|#)(\\d+)").find(q)
@@ -719,9 +1160,7 @@ class MainActivity : Activity() {
                 tabs.find { it.id == parsedId }?.let { return it }
                 if (parsedId in 1..tabs.size) return tabs[parsedId - 1]
             }
-            tabs.find {
-                it.title.lowercase(Locale.ROOT).contains(q) || it.url.lowercase(Locale.ROOT).contains(q)
-            }?.let { return it }
+            tabs.find { it.title.lowercase(Locale.ROOT).contains(q) || it.url.lowercase(Locale.ROOT).contains(q) }?.let { return it }
         }
         return null
     }
@@ -730,7 +1169,6 @@ class MainActivity : Activity() {
         mainHandler.post {
             tabBarContainer.removeAllViews()
             val curId = activeTab?.id ?: -1
-
             for (t in tabs) {
                 val isCurrent = (t.id == curId)
                 val tabBox = LinearLayout(this).apply {
@@ -738,14 +1176,10 @@ class MainActivity : Activity() {
                     gravity = Gravity.CENTER_VERTICAL
                     setBackgroundColor(Color.parseColor(if (isCurrent) "#1565C0" else "#252525"))
                     setPadding(dp(8), dp(3), dp(4), dp(3))
-                    layoutParams = LinearLayout.LayoutParams(
-                        ViewGroup.LayoutParams.WRAP_CONTENT,
-                        dp(28)
-                    ).apply { marginEnd = dp(5) }
+                    layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(28)).apply { marginEnd = dp(5) }
                     setOnClickListener { switchToTab(t) }
                 }
-
-                val cleanTitle = t.title.ifEmpty { t.url.removePrefix("https://").removePrefix("http://") }.take(16)
+                val cleanTitle = t.title.ifEmpty { t.url.removePrefix("https://") }.take(16)
                 val titleTv = TextView(this).apply {
                     text = "${t.id}: $cleanTitle"
                     setTextColor(Color.WHITE)
@@ -754,7 +1188,6 @@ class MainActivity : Activity() {
                     setSingleLine(true)
                     setPadding(0, 0, dp(6), 0)
                 }
-
                 val closeBtn = TextView(this).apply {
                     text = "✕"
                     setTextColor(Color.parseColor(if (isCurrent) "#FFCDD2" else "#AAAAAA"))
@@ -763,7 +1196,6 @@ class MainActivity : Activity() {
                     setPadding(dp(5), dp(1), dp(5), dp(1))
                     setOnClickListener { closeTab(t) }
                 }
-
                 tabBox.addView(titleTv)
                 tabBox.addView(closeBtn)
                 tabBarContainer.addView(tabBox)
@@ -775,13 +1207,10 @@ class MainActivity : Activity() {
                 typeface = Typeface.DEFAULT_BOLD
                 setTextColor(Color.WHITE)
                 setBackgroundColor(Color.parseColor("#00897B"))
-                minWidth = 0; minimumWidth = 0
-                minHeight = 0; minimumHeight = 0
+                minWidth = 0; minimumWidth = 0; minHeight = 0; minimumHeight = 0
                 setPadding(dp(10), dp(2), dp(10), dp(2))
                 layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(28))
-                setOnClickListener {
-                    createNewTab("https://gemini.google.com", switchToIt = true)
-                }
+                setOnClickListener { createNewTab("https://gemini.google.com", switchToIt = true) }
             }
             tabBarContainer.addView(addTabBtn)
         }
@@ -789,53 +1218,26 @@ class MainActivity : Activity() {
 
     // ==================== DOWNLOAD ENGINE ====================
 
-    private fun startBrowserDownload(
-        url: String,
-        userAgent: String?,
-        contentDisposition: String?,
-        mimeType: String?
-    ) {
+    private fun startBrowserDownload(url: String, userAgent: String?, contentDisposition: String?, mimeType: String?) {
         try {
             if (url.startsWith("blob:")) {
                 val safeBlobUrl = url.replace("'", "\\'")
                 val js = """
                     (function() {
-                        fetch('$safeBlobUrl')
-                            .then(r => r.blob())
-                            .then(blob => {
-                                const reader = new FileReader();
-                                reader.onloadend = function() {
-                                    const b64 = (reader.result || '').split(',')[1] || '';
-                                    const ext = (blob.type && blob.type.split('/')[1]) ? '.' + blob.type.split('/')[1].split(';')[0] : '.bin';
-                                    const fname = 'gemini_download_' + Date.now() + ext;
-                                    if (window.AIAgentBridge && window.AIAgentBridge.saveBase64Download) {
-                                        window.AIAgentBridge.saveBase64Download(b64, fname, blob.type || 'application/octet-stream');
-                                    }
-                                };
-                                reader.readAsDataURL(blob);
-                            })
-                            .catch(e => console.error('Blob download error:', e));
+                        fetch('$safeBlobUrl').then(r => r.blob()).then(blob => {
+                            const reader = new FileReader();
+                            reader.onloadend = function() {
+                                const b64 = (reader.result || '').split(',')[1] || '';
+                                const ext = (blob.type && blob.type.split('/')[1]) ? '.' + blob.type.split('/')[1].split(';')[0] : '.bin';
+                                if (window.AIAgentBridge && window.AIAgentBridge.saveBase64Download) {
+                                    window.AIAgentBridge.saveBase64Download(b64, 'gemini_download_' + Date.now() + ext, blob.type || 'application/octet-stream');
+                                }
+                            };
+                            reader.readAsDataURL(blob);
+                        });
                     })();
                 """.trimIndent()
                 mainHandler.post { webView.evaluateJavascript(js, null) }
-                return
-            }
-
-            if (url.startsWith("data:")) {
-                val commaIdx = url.indexOf(',')
-                if (commaIdx != -1) {
-                    val meta = url.substring(5, commaIdx)
-                    val dataPart = url.substring(commaIdx + 1)
-                    val mime = meta.substringBefore(";").ifEmpty { "application/octet-stream" }
-                    val ext = MimeTypeMap.getSingleton().getExtensionFromMimeType(mime)?.let { ".$it" } ?: ".bin"
-                    val fileName = "gemini_data_${System.currentTimeMillis()}$ext"
-                    val bytes = if (meta.contains("base64", ignoreCase = true)) {
-                        Base64.decode(dataPart, Base64.DEFAULT)
-                    } else {
-                        Uri.decode(dataPart).toByteArray(Charsets.UTF_8)
-                    }
-                    saveBytesToDownloads(bytes, fileName)
-                }
                 return
             }
 
@@ -843,24 +1245,18 @@ class MainActivity : Activity() {
             val request = DownloadManager.Request(Uri.parse(url)).apply {
                 setMimeType(mimeType)
                 val cookies = CookieManager.getInstance().getCookie(url)
-                if (!cookies.isNullOrEmpty()) {
-                    addRequestHeader("Cookie", cookies)
-                }
+                if (!cookies.isNullOrEmpty()) addRequestHeader("Cookie", cookies)
                 addRequestHeader("User-Agent", userAgent ?: mobileUA)
                 setDescription("Downloading via Gemini Browser...")
                 setTitle(fileName)
                 setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
                 setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
             }
-
             val dm = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
             dm.enqueue(request)
             appendLog("📥 Downloading: $fileName")
-            setConsoleStatus("🟢 Downloading: $fileName", false)
-            Toast.makeText(this, "📥 Downloading: $fileName", Toast.LENGTH_SHORT).show()
         } catch (e: Exception) {
             appendLog("Download Error: ${e.message}")
-            Toast.makeText(this, "Download Failed: ${e.message}", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -871,14 +1267,8 @@ class MainActivity : Activity() {
                 if (!dlDir.exists()) dlDir.mkdirs()
                 val outFile = File(dlDir, fileName)
                 FileOutputStream(outFile).use { it.write(bytes) }
-                appendLog("✅ Saved to Downloads: ${outFile.name} (${bytes.size} bytes)")
-                setConsoleStatus("🟢 Saved: ${outFile.name}", false)
-                mainHandler.post {
-                    Toast.makeText(this@MainActivity, "✅ Downloaded: ${outFile.name}", Toast.LENGTH_SHORT).show()
-                }
-            } catch (e: Exception) {
-                appendLog("Save Download Error: ${e.message}")
-            }
+                appendLog("✅ Saved: ${outFile.name}")
+            } catch (_: Exception) {}
         }
     }
 
@@ -902,250 +1292,39 @@ class MainActivity : Activity() {
             setBackgroundColor(Color.parseColor("#181818"))
         }
 
-        val titleTv = TextView(this).apply {
-            text = "⚡ UserScript Manager (Gemini Browser)"
-            setTextColor(Color.parseColor("#00E676"))
-            textSize = 14f
-            typeface = Typeface.DEFAULT_BOLD
-            setPadding(0, 0, 0, dp(8))
-        }
-        container.addView(titleTv)
-
-        var dialogRef: AlertDialog? = null
-
-        for (i in 0 until scripts.length()) {
-            val obj = scripts.getJSONObject(i)
-            val sName = obj.optString("name", "Script #${i + 1}")
-            val sEnabled = obj.optBoolean("enabled", true)
-            val sCode = obj.optString("code", "")
-
-            val row = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                setBackgroundColor(Color.parseColor("#262626"))
-                setPadding(dp(8), dp(6), dp(8), dp(6))
-                layoutParams = LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT
-                ).apply { bottomMargin = dp(4) }
-            }
-
-            val nameLabel = TextView(this).apply {
-                text = (if (sEnabled) "🟢 " else "⚪ ") + sName
-                setTextColor(Color.WHITE)
-                textSize = 12f
-                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            }
-
-            val btnToggle = Button(this).apply {
-                text = if (sEnabled) "ON" else "OFF"
-                textSize = 9f
-                setTextColor(Color.WHITE)
-                setBackgroundColor(if (sEnabled) Color.parseColor("#2E7D32") else Color.parseColor("#555555"))
-                minWidth = 0; minimumWidth = 0
-                setPadding(dp(6), dp(2), dp(6), dp(2))
-                layoutParams = LinearLayout.LayoutParams(dp(44), dp(28)).apply { marginEnd = dp(4) }
-                setOnClickListener {
-                    obj.put("enabled", !sEnabled)
-                    saveUserScripts(scripts)
-                    dialogRef?.dismiss()
-                    showUserScriptDialog()
-                }
-            }
-
-            val btnRun = Button(this).apply {
-                text = "RUN"
-                textSize = 9f
-                setTextColor(Color.WHITE)
-                setBackgroundColor(Color.parseColor("#1565C0"))
-                minWidth = 0; minimumWidth = 0
-                setPadding(dp(6), dp(2), dp(6), dp(2))
-                layoutParams = LinearLayout.LayoutParams(dp(48), dp(28)).apply { marginEnd = dp(4) }
-                setOnClickListener {
-                    runSingleUserScriptOnPage(webView, sName, sCode)
-                    Toast.makeText(this@MainActivity, "Executed: $sName", Toast.LENGTH_SHORT).show()
-                }
-            }
-
-            val btnEdit = Button(this).apply {
-                text = "EDIT"
-                textSize = 9f
-                setTextColor(Color.WHITE)
-                setBackgroundColor(Color.parseColor("#6A1B9A"))
-                minWidth = 0; minimumWidth = 0
-                setPadding(dp(6), dp(2), dp(6), dp(2))
-                layoutParams = LinearLayout.LayoutParams(dp(48), dp(28)).apply { marginEnd = dp(4) }
-                setOnClickListener {
-                    dialogRef?.dismiss()
-                    showUserScriptDialog(i)
-                }
-            }
-
-            val btnDel = Button(this).apply {
-                text = "✕"
-                textSize = 9f
-                setTextColor(Color.WHITE)
-                setBackgroundColor(Color.parseColor("#C62828"))
-                minWidth = 0; minimumWidth = 0
-                setPadding(dp(4), dp(2), dp(4), dp(2))
-                layoutParams = LinearLayout.LayoutParams(dp(34), dp(28))
-                setOnClickListener {
-                    val nextArr = JSONArray()
-                    for (idx in 0 until scripts.length()) {
-                        if (idx != i) nextArr.put(scripts.getJSONObject(idx))
-                    }
-                    saveUserScripts(nextArr)
-                    dialogRef?.dismiss()
-                    showUserScriptDialog()
-                }
-            }
-
-            row.addView(nameLabel)
-            row.addView(btnToggle)
-            row.addView(btnRun)
-            row.addView(btnEdit)
-            row.addView(btnDel)
-            container.addView(row)
-        }
-
         val editingObj = if (editIndex in 0 until scripts.length()) scripts.getJSONObject(editIndex) else null
-
         val nameInput = EditText(this).apply {
-            hint = "Script Name (e.g. Auto Fill / Custom UI)"
-            setHintTextColor(Color.GRAY)
+            hint = "Script Name"
             setTextColor(Color.WHITE)
             setBackgroundColor(Color.parseColor("#2A2A2A"))
-            textSize = 12f
-            setSingleLine(true)
-            setPadding(dp(8), dp(8), dp(8), dp(8))
             setText(editingObj?.optString("name", "") ?: "")
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(8); bottomMargin = dp(6) }
         }
-
         val codeInput = EditText(this).apply {
-            hint = "// Paste JavaScript or Tampermonkey UserScript here..."
-            setHintTextColor(Color.GRAY)
+            hint = "// JS Code..."
             setTextColor(Color.parseColor("#80CBC4"))
             setBackgroundColor(Color.parseColor("#0D0D0D"))
             typeface = Typeface.MONOSPACE
-            textSize = 11f
-            minLines = 7
-            maxLines = 12
-            gravity = Gravity.TOP or Gravity.START
-            setPadding(dp(8), dp(8), dp(8), dp(8))
+            minLines = 6
             setText(editingObj?.optString("code", "") ?: "")
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(6) }
         }
-
-        val helperRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(8) }
-        }
-
-        val btnPasteClip = Button(this).apply {
-            text = "📋 Paste Clipboard"
-            textSize = 10f
-            setTextColor(Color.WHITE)
-            setBackgroundColor(Color.parseColor("#37474F"))
-            layoutParams = LinearLayout.LayoutParams(0, dp(34), 1f).apply { marginEnd = dp(4) }
-            setOnClickListener {
-                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                val clipTxt = cm.primaryClip?.getItemAt(0)?.coerceToText(this@MainActivity)?.toString() ?: ""
-                if (clipTxt.isNotEmpty()) {
-                    codeInput.setText(clipTxt)
-                    if (nameInput.text.toString().trim().isEmpty()) {
-                        val nameMatch = Regex("//\\s*@name\\s+(.+)").find(clipTxt)
-                        if (nameMatch != null) {
-                            nameInput.setText(nameMatch.groupValues[1].trim())
-                        }
-                    }
-                    Toast.makeText(this@MainActivity, "Pasted (${clipTxt.length} chars)", Toast.LENGTH_SHORT).show()
-                }
-            }
-        }
-
-        val btnClearCode = Button(this).apply {
-            text = "🗑️ Clear Box"
-            textSize = 10f
-            setTextColor(Color.WHITE)
-            setBackgroundColor(Color.parseColor("#455A64"))
-            layoutParams = LinearLayout.LayoutParams(0, dp(34), 1f)
-            setOnClickListener { codeInput.setText("") }
-        }
-
-        helperRow.addView(btnPasteClip)
-        helperRow.addView(btnClearCode)
-
-        val actionRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            )
-        }
-
-        val btnRunNow = Button(this).apply {
-            text = "▶ Run Once Now"
-            textSize = 11f
-            setTextColor(Color.WHITE)
-            setBackgroundColor(Color.parseColor("#0277BD"))
-            layoutParams = LinearLayout.LayoutParams(0, dp(38), 1f).apply { marginEnd = dp(6) }
-            setOnClickListener {
-                val jsCode = codeInput.text.toString()
-                if (jsCode.trim().isNotEmpty()) {
-                    runSingleUserScriptOnPage(webView, nameInput.text.toString().ifEmpty { "TempScript" }, jsCode)
-                    Toast.makeText(this@MainActivity, "Script Executed!", Toast.LENGTH_SHORT).show()
-                    dialogRef?.dismiss()
-                }
-            }
-        }
-
-        val btnSaveAuto = Button(this).apply {
-            text = if (editIndex >= 0) "💾 Update Script" else "💾 Save & Auto-Run"
-            textSize = 11f
-            setTextColor(Color.WHITE)
-            setBackgroundColor(Color.parseColor("#2E7D32"))
-            layoutParams = LinearLayout.LayoutParams(0, dp(38), 1f)
-            setOnClickListener {
-                val jsCode = codeInput.text.toString().trim()
-                if (jsCode.isEmpty()) return@setOnClickListener
-                var sName = nameInput.text.toString().trim()
-                if (sName.isEmpty()) {
-                    val m = Regex("//\\s*@name\\s+(.+)").find(jsCode)
-                    sName = m?.groupValues?.get(1)?.trim() ?: "UserScript #${scripts.length() + 1}"
-                }
-                val entry = JSONObject().put("name", sName).put("code", jsCode).put("enabled", true)
-                if (editIndex in 0 until scripts.length()) scripts.put(editIndex, entry) else scripts.put(entry)
-                saveUserScripts(scripts)
-                runSingleUserScriptOnPage(webView, sName, jsCode)
-                Toast.makeText(this@MainActivity, "Saved & Executed: $sName", Toast.LENGTH_SHORT).show()
-                dialogRef?.dismiss()
-            }
-        }
-
-        actionRow.addView(btnRunNow)
-        actionRow.addView(btnSaveAuto)
-
         container.addView(nameInput)
         container.addView(codeInput)
-        container.addView(helperRow)
-        container.addView(actionRow)
         scroll.addView(container)
 
-        dialogRef = AlertDialog.Builder(this)
+        AlertDialog.Builder(this)
+            .setTitle("⚡ UserScript Manager")
             .setView(scroll)
+            .setPositiveButton("Save & Run") { _, _ ->
+                val jsCode = codeInput.text.toString().trim()
+                if (jsCode.isNotEmpty()) {
+                    val sName = nameInput.text.toString().ifEmpty { "Script #${scripts.length() + 1}" }
+                    scripts.put(JSONObject().put("name", sName).put("code", jsCode).put("enabled", true))
+                    saveUserScripts(scripts)
+                    runSingleUserScriptOnPage(webView, sName, jsCode)
+                }
+            }
             .setNegativeButton("Close", null)
-            .create()
-        dialogRef.show()
+            .show()
     }
 
     private fun scriptMatchesUrl(code: String, url: String): Boolean {
@@ -1162,32 +1341,17 @@ class MainActivity : Activity() {
 
     private fun runSingleUserScriptOnPage(targetWv: WebView, name: String, rawCode: String) {
         val b64 = Base64.encodeToString(rawCode.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
-        val safeName = name.replace("'", "\\'")
         val js = """
             (function() {
                 try {
-                    if (typeof window.GM_addStyle === 'undefined') {
-                        window.GM_addStyle = function(css) {
-                            const s = document.createElement('style');
-                            s.textContent = css;
-                            (document.head || document.documentElement).appendChild(s);
-                            return s;
-                        };
-                    }
                     const bin = atob('$b64');
                     const bytes = new Uint8Array(bin.length);
                     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-                    const decodedCode = new TextDecoder('utf-8').decode(bytes);
-                    new Function(decodedCode)();
-                } catch (e) {
-                    console.error('[UserScript Error] $safeName:', e);
-                }
+                    new Function(new TextDecoder('utf-8').decode(bytes))();
+                } catch (e) {}
             })();
         """.trimIndent()
-        mainHandler.post {
-            targetWv.evaluateJavascript(js, null)
-            appendLog("UserScript ran: $name")
-        }
+        mainHandler.post { targetWv.evaluateJavascript(js, null) }
     }
 
     private fun injectSavedUserScripts(targetWv: WebView, url: String) {
@@ -1215,8 +1379,7 @@ class MainActivity : Activity() {
 
         if (tab.desktopMode) {
             val density = resources.displayMetrics.density
-            val targetCssWidth = 1280f
-            val targetPxW = (targetCssWidth * density).toInt()
+            val targetPxW = (1280f * density).toInt()
             val scale = cw.toFloat() / targetPxW.toFloat()
             val targetPxH = (ch.toFloat() / scale).toInt()
 
@@ -1258,7 +1421,6 @@ class MainActivity : Activity() {
             updateWebViewViewportBounds(tab)
             tab.webView.reload()
         }
-        appendLog("Tab #${tab.id} Desktop Mode -> $enable")
     }
 
     private fun makeSmallButton(label: String, onClick: () -> Unit): Button {
@@ -1269,9 +1431,7 @@ class MainActivity : Activity() {
             setBackgroundColor(Color.parseColor("#333333"))
             minWidth = 0; minimumWidth = 0
             setPadding(dp(6), dp(2), dp(6), dp(2))
-            layoutParams = LinearLayout.LayoutParams(dp(40), dp(36)).apply {
-                marginEnd = dp(3)
-            }
+            layoutParams = LinearLayout.LayoutParams(dp(40), dp(36)).apply { marginEnd = dp(3) }
             setOnClickListener { onClick() }
         }
     }
@@ -1336,9 +1496,7 @@ class MainActivity : Activity() {
                 try {
                     val bytes = Base64.decode(base64Data, Base64.DEFAULT)
                     saveBytesToDownloads(bytes, fileName)
-                } catch (e: Exception) {
-                    appendLog("Blob decode error: ${e.message}")
-                }
+                } catch (_: Exception) {}
             }
         }, "AIAgentBridge")
 
@@ -1352,11 +1510,9 @@ class MainActivity : Activity() {
                 tab.isPageLoading = true
                 tab.isNetworkIdle = false
                 tab.url = url ?: ""
+                domGeneration.incrementAndGet()
                 if (activeTab?.id == tab.id) {
                     urlInput.setText(tab.url)
-                    if (serverStarted.get()) {
-                        setConsoleStatus("🟢 127.0.0.1:$SERVER_PORT | Tab #${tab.id} Loading...", false)
-                    }
                 }
                 injectStealthViewportAndTracker(tab)
                 refreshTabBarUi()
@@ -1367,11 +1523,9 @@ class MainActivity : Activity() {
                 tab.isPageLoading = false
                 tab.url = url ?: ""
                 tab.title = view?.title ?: "Tab ${tab.id}"
+                domGeneration.incrementAndGet()
                 if (activeTab?.id == tab.id) {
                     urlInput.setText(tab.url)
-                    if (serverStarted.get()) {
-                        setConsoleStatus("🟢 ONLINE 127.0.0.1:$SERVER_PORT | Tab #${tab.id} Ready", false)
-                    }
                 }
                 CookieManager.getInstance().flush()
                 injectStealthViewportAndTracker(tab)
@@ -1382,12 +1536,7 @@ class MainActivity : Activity() {
         }
 
         wv.webChromeClient = object : WebChromeClient() {
-            override fun onCreateWindow(
-                view: WebView?,
-                isDialog: Boolean,
-                isUserGesture: Boolean,
-                resultMsg: Message?
-            ): Boolean {
+            override fun onCreateWindow(view: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: Message?): Boolean {
                 val transport = resultMsg?.obj as? WebView.WebViewTransport ?: return false
                 val createdTab = createNewTab("", switchToIt = true)
                 transport.webView = createdTab.webView
@@ -1404,19 +1553,16 @@ class MainActivity : Activity() {
             }
 
             override fun onJsAlert(view: WebView?, url: String?, message: String?, result: JsResult?): Boolean {
-                appendLog("Auto-Accepted Alert: $message")
                 result?.confirm()
                 return true
             }
 
             override fun onJsConfirm(view: WebView?, url: String?, message: String?, result: JsResult?): Boolean {
-                appendLog("Auto-Confirmed Dialog: $message")
                 result?.confirm()
                 return true
             }
 
             override fun onJsPrompt(view: WebView?, url: String?, message: String?, defaultValue: String?, result: JsPromptResult?): Boolean {
-                appendLog("Auto-Prompt Dialog: $message")
                 result?.confirm(defaultValue ?: "")
                 return true
             }
@@ -1430,7 +1576,6 @@ class MainActivity : Activity() {
                 if (!path.isNullOrEmpty()) {
                     val f = File(path)
                     if (f.exists()) {
-                        appendLog("Auto-Uploaded File: ${f.name}")
                         filePathCallback?.onReceiveValue(arrayOf(Uri.fromFile(f)))
                         queuedFilePath = null
                         return true
@@ -1450,30 +1595,6 @@ class MainActivity : Activity() {
                     Object.defineProperty(navigator, 'webdriver', { get: () => false, configurable: true });
                     window.chrome = window.chrome || { runtime: {}, app: {}, csi: function(){}, loadTimes: function(){} };
                     Object.defineProperty(navigator, 'vendor', { get: () => 'Google Inc.', configurable: true });
-
-                    const brandsList = [
-                        { brand: 'Not/A)Brand', version: '8' },
-                        { brand: 'Chromium', version: '126' },
-                        { brand: 'Google Chrome', version: '126' }
-                    ];
-                    Object.defineProperty(navigator, 'userAgentData', {
-                        get: () => ({
-                            brands: brandsList,
-                            mobile: !$isPc,
-                            platform: $isPc ? 'Linux' : 'Android',
-                            getHighEntropyValues: async () => ({
-                                architecture: $isPc ? 'x86' : 'arm',
-                                bitness: '64',
-                                brands: brandsList,
-                                mobile: !$isPc,
-                                model: $isPc ? '' : 'Pixel 8',
-                                platform: $isPc ? 'Linux' : 'Android',
-                                platformVersion: '14.0.0',
-                                uaFullVersion: '126.0.6478.122'
-                            })
-                        }),
-                        configurable: true
-                    });
                 } catch (e) {}
 
                 // React / Vue / Angular / GitHub State-Safe Value Setter
@@ -1493,13 +1614,21 @@ class MainActivity : Activity() {
                             if ((el.innerText || '').trim().length > 0) el.innerText = '';
                         }
                         if (insertedDelta && insertedDelta.length > 0) {
-                            if (!document.execCommand('insertText', false, insertedDelta)) {
-                                el.innerText = newValue;
+                            try {
+                                const dt = new DataTransfer();
+                                dt.setData('text/plain', insertedDelta);
+                                const pasteEv = new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true, composed: true });
+                                el.dispatchEvent(pasteEv);
+                                if (!pasteEv.defaultPrevented) {
+                                    document.execCommand('insertText', false, insertedDelta);
+                                }
+                            } catch (err) {
+                                document.execCommand('insertText', false, insertedDelta);
                             }
                         }
-                        el.dispatchEvent(new InputEvent('input', { data: insertedDelta || newValue, inputType: 'insertText', bubbles: true, cancelable: false, composed: true }));
+                        el.dispatchEvent(new InputEvent('input', { data: insertedDelta || newValue, inputType: 'insertFromPaste', bubbles: true, composed: true }));
                         el.dispatchEvent(new Event('change', { bubbles: true }));
-                        return 'contenteditable';
+                        return 'contenteditable_paste';
                     }
 
                     if ('value' in el) {
@@ -1521,12 +1650,6 @@ class MainActivity : Activity() {
                             try { el._valueTracker.setValue(prevVal); } catch (e) {}
                         }
 
-                        try {
-                            if (typeof el.setSelectionRange === 'function') {
-                                el.setSelectionRange(targetVal.length, targetVal.length);
-                            }
-                        } catch (e) {}
-
                         el.dispatchEvent(new InputEvent('beforeinput', { data: insertedDelta || targetVal, inputType: 'insertText', bubbles: true, cancelable: true, composed: true }));
                         el.dispatchEvent(new InputEvent('input', { data: insertedDelta || targetVal, inputType: 'insertText', bubbles: true, cancelable: false, composed: true }));
                         el.dispatchEvent(new Event('change', { bubbles: true }));
@@ -1545,96 +1668,9 @@ class MainActivity : Activity() {
                     } catch (e) {}
                 };
 
-                window.__aiOpenSelectModal = function(selectEl) {
-                    if (!selectEl || selectEl.tagName !== 'SELECT') return false;
-                    const existing = document.getElementById('__ai_select_modal');
-                    if (existing) existing.remove();
-
-                    const modal = document.createElement('div');
-                    modal.id = '__ai_select_modal';
-                    modal.style.cssText = 'position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(0,0,0,0.65);z-index:2147483647;display:flex;align-items:center;justify-content:center;padding:16px;box-sizing:border-box;font-family:sans-serif;';
-
-                    const card = document.createElement('div');
-                    card.style.cssText = 'background:#2b2b2b;color:#fff;width:100%;max-width:420px;max-height:82vh;border-radius:12px;overflow-y:auto;box-shadow:0 10px 30px rgba(0,0,0,0.8);border:1px solid #444;';
-
-                    for (let i = 0; i < selectEl.options.length; i++) {
-                        const opt = selectEl.options[i];
-                        const isSelected = (selectEl.selectedIndex === i);
-                        const item = document.createElement('div');
-                        item.setAttribute('role', 'option');
-                        item.setAttribute('data-ai-select-index', i);
-                        item.setAttribute('data-ai-option-value', opt.value || '');
-                        item.style.cssText = 'padding:14px 18px;border-bottom:1px solid #3d3d3d;display:flex;align-items:center;justify-content:space-between;cursor:pointer;font-size:15px;' + (isSelected ? 'background:#1e3a2f;color:#00e676;font-weight:bold;' : '');
-
-                        const spanTxt = document.createElement('span');
-                        spanTxt.textContent = (opt.text || opt.label || opt.value || '').trim();
-
-                        const radio = document.createElement('span');
-                        radio.textContent = isSelected ? '◉' : '○';
-                        radio.style.cssText = 'font-size:18px;margin-left:12px;color:' + (isSelected ? '#4dd0e1' : '#aaa') + ';';
-
-                        item.appendChild(spanTxt);
-                        item.appendChild(radio);
-
-                        item.addEventListener('click', function(ev) {
-                            ev.stopPropagation();
-                            selectEl.selectedIndex = i;
-                            selectEl.value = opt.value;
-                            selectEl.dispatchEvent(new Event('focus', { bubbles: true }));
-                            selectEl.dispatchEvent(new Event('input', { bubbles: true }));
-                            selectEl.dispatchEvent(new Event('change', { bubbles: true }));
-                            if (window.jQuery) { try { window.jQuery(selectEl).trigger('change'); } catch (e) {} }
-                            modal.remove();
-                        });
-                        card.appendChild(item);
-                    }
-
-                    modal.addEventListener('click', function(ev) {
-                        if (ev.target === modal) modal.remove();
-                    });
-                    modal.appendChild(card);
-                    document.body.appendChild(modal);
-                    return true;
-                };
-
-                if (!window.__aiSelectHooked) {
-                    window.__aiSelectHooked = true;
-                    document.addEventListener('mousedown', function(e) {
-                        const sel = e.target && e.target.closest ? e.target.closest('select') : null;
-                        if (sel && !sel.multiple) {
-                            e.preventDefault();
-                            e.stopPropagation();
-                            window.__aiOpenSelectModal(sel);
-                        }
-                    }, true);
-                }
-
-                if (!window.__aiDownloadHooked) {
-                    window.__aiDownloadHooked = true;
-                    document.addEventListener('click', function(e) {
-                        const a = e.target && e.target.closest ? e.target.closest('a[download], a[href^="blob:"], a[href^="data:"]') : null;
-                        if (a && a.href && (a.href.startsWith('blob:') || a.href.startsWith('data:'))) {
-                            const fname = a.getAttribute('download') || ('gemini_file_' + Date.now());
-                            if (a.href.startsWith('blob:')) {
-                                e.preventDefault();
-                                fetch(a.href).then(r => r.blob()).then(blob => {
-                                    const reader = new FileReader();
-                                    reader.onloadend = function() {
-                                        const b64 = (reader.result || '').split(',')[1] || '';
-                                        if (window.AIAgentBridge && window.AIAgentBridge.saveBase64Download) {
-                                            window.AIAgentBridge.saveBase64Download(b64, fname, blob.type || 'application/octet-stream');
-                                        }
-                                    };
-                                    reader.readAsDataURL(blob);
-                                });
-                            }
-                        }
-                    }, true);
-                }
-
+                // Auto-Click Newly Appeared Latest "Allow" Button (Gemini MCP Tool Confirmation)
                 if (!window.__geminiAllowClickerInstalled) {
                     window.__geminiAllowClickerInstalled = true;
-
                     function findAndClickLatestAllow() {
                         try {
                             const candidates = [];
@@ -1648,35 +1684,20 @@ class MainActivity : Activity() {
                                     if (txt.toLowerCase() === 'allow' || aria.toLowerCase() === 'allow') {
                                         const r = el.getBoundingClientRect();
                                         const s = window.getComputedStyle(el);
-                                        if (r.width > 10 && r.height > 10 &&
-                                            s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0' &&
-                                            !el.disabled && el.getAttribute('aria-disabled') !== 'true') {
+                                        if (r.width > 10 && r.height > 10 && s.display !== 'none' && s.visibility !== 'hidden' && !el.disabled) {
                                             candidates.push(el);
                                         }
                                     }
                                 }
-                                const allNodes = root.querySelectorAll('*');
-                                for (let i = 0; i < allNodes.length; i++) {
-                                    if (allNodes[i].shadowRoot) collectButtons(allNodes[i].shadowRoot);
-                                }
                             }
-
                             collectButtons(document);
-
                             if (candidates.length > 0) {
                                 const latestBtn = candidates[candidates.length - 1];
                                 const now = Date.now();
                                 const lastClickedTime = parseInt(latestBtn.getAttribute('data-ai-allow-ts') || '0', 10);
-
                                 if (now - lastClickedTime > 1200) {
                                     latestBtn.setAttribute('data-ai-allow-ts', String(now));
-                                    const evOpts = { bubbles: true, cancelable: true, composed: true, view: window };
-                                    latestBtn.dispatchEvent(new PointerEvent('pointerdown', evOpts));
-                                    latestBtn.dispatchEvent(new MouseEvent('mousedown', evOpts));
-                                    latestBtn.dispatchEvent(new PointerEvent('pointerup', evOpts));
-                                    latestBtn.dispatchEvent(new MouseEvent('mouseup', evOpts));
                                     latestBtn.click();
-
                                     if (window.AIAgentBridge && window.AIAgentBridge.onAutoAllowed) {
                                         window.AIAgentBridge.onAutoAllowed('Allow button #' + candidates.length);
                                     }
@@ -1684,80 +1705,25 @@ class MainActivity : Activity() {
                             }
                         } catch (err) {}
                     }
-
-                    const allowObs = new MutationObserver(function() { findAndClickLatestAllow(); });
-                    if (document.documentElement) {
-                        allowObs.observe(document.documentElement, { childList: true, subtree: true });
-                    }
                     setInterval(findAndClickLatestAllow, 350);
-                    findAndClickLatestAllow();
                 }
-
-                if (window.__aiTrackerInstalled) return;
-                window.__aiTrackerInstalled = true;
-                window.__aiPendingReq = 0;
-                let timer = null;
-
-                function checkIdle() {
-                    clearTimeout(timer);
-                    if (window.__aiPendingReq <= 0) {
-                        timer = setTimeout(function() {
-                            if (window.__aiPendingReq <= 0 && window.AIAgentBridge) {
-                                window.AIAgentBridge.onIdle(window.location.href);
-                            }
-                        }, 500);
-                    }
-                }
-
-                const origFetch = window.fetch;
-                if (origFetch) {
-                    window.fetch = function() {
-                        window.__aiPendingReq++;
-                        return origFetch.apply(this, arguments).finally(function() {
-                            window.__aiPendingReq = Math.max(0, window.__aiPendingReq - 1);
-                            checkIdle();
-                        });
-                    };
-                }
-
-                const origSend = XMLHttpRequest.prototype.send;
-                XMLHttpRequest.prototype.send = function() {
-                    window.__aiPendingReq++;
-                    this.addEventListener('loadend', function() {
-                        window.__aiPendingReq = Math.max(0, window.__aiPendingReq - 1);
-                        checkIdle();
-                    });
-                    return origSend.apply(this, arguments);
-                };
-
-                if (document.body) {
-                    new MutationObserver(function() { checkIdle(); })
-                        .observe(document.body, { childList: true, subtree: true });
-                }
-                checkIdle();
             })();
         """.trimIndent()
         tab.webView.evaluateJavascript(js, null)
     }
 
     private fun ensureServerRunning() {
-        if (serverStarted.get() && serverSocket != null && !serverSocket!!.isClosed) {
-            setConsoleStatus("🟢 ONLINE 127.0.0.1:$SERVER_PORT | AI: Ready", false)
-            return
-        }
+        if (serverStarted.get() && serverSocket != null && !serverSocket!!.isClosed) return
 
         serverPool.execute {
             try { serverSocket?.close() } catch (_: Exception) {}
-
             try {
                 val sock = ServerSocket()
                 sock.reuseAddress = true
                 sock.bind(InetSocketAddress("0.0.0.0", SERVER_PORT), 50)
                 serverSocket = sock
                 serverStarted.set(true)
-
-                setConsoleStatus("🟢 ONLINE 127.0.0.1:$SERVER_PORT | AI: Ready", false)
-                appendLog("Server listening on 0.0.0.0:$SERVER_PORT (Termux Ready)")
+                setConsoleStatus("🟢 ONLINE 127.0.0.1:$SERVER_PORT | TinyFish Ready", false)
 
                 while (serverStarted.get() && !sock.isClosed) {
                     val client = sock.accept()
@@ -1769,7 +1735,6 @@ class MainActivity : Activity() {
             } catch (e: Exception) {
                 serverStarted.set(false)
                 setConsoleStatus("🔴 SERVER ERROR $SERVER_PORT: ${e.message}", true)
-                appendLog("Server error: ${e.message}")
             }
         }
     }
@@ -1829,23 +1794,6 @@ class MainActivity : Activity() {
                 parseQueryParams(rawPath)
             }
 
-            if (path == "/events") {
-                val pw = PrintWriter(OutputStreamWriter(out, Charsets.UTF_8), true)
-                pw.print("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n")
-                pw.flush()
-                sseClients.add(pw)
-                try {
-                    while (!socket.isClosed && !pw.checkError()) {
-                        Thread.sleep(5000)
-                        pw.print("data: {\"event\":\"ping\"}\n\n")
-                        pw.flush()
-                    }
-                } finally {
-                    sseClients.remove(pw)
-                }
-                return
-            }
-
             val responseJson = executeCommand(method, path, jsonBody)
             val bytes = responseJson.toByteArray(Charsets.UTF_8)
             val headers = "HTTP/1.1 200 OK\r\n" +
@@ -1876,8 +1824,6 @@ class MainActivity : Activity() {
                     .put("active", t.id == curId)
                     .put("url", t.url)
                     .put("title", t.title)
-                    .put("loading", t.isPageLoading)
-                    .put("desktop_mode", t.desktopMode)
             )
         }
         return arr
@@ -1886,84 +1832,37 @@ class MainActivity : Activity() {
     private fun handleTabsApiSync(defaultAction: String, body: JSONObject?): String {
         val action = body?.optString("action", defaultAction)?.lowercase(Locale.ROOT) ?: defaultAction
         return when (action) {
-            "list" -> {
-                JSONObject()
-                    .put("status", "ok")
-                    .put("active_tab_id", activeTab?.id ?: -1)
-                    .put("tabs_count", tabs.size)
-                    .put("tabs", buildTabsJsonArray())
-                    .toString()
-            }
             "new", "open", "create" -> {
                 val url = body?.optString("url", "https://gemini.google.com") ?: "https://gemini.google.com"
-                val switchToIt = body?.optBoolean("switch", true) ?: true
                 var createdTab: BrowserTab? = null
-                runOnMainSync {
-                    createdTab = createNewTab(url, switchToIt)
-                }
-                JSONObject()
-                    .put("status", "tab_created")
-                    .put("tab_id", createdTab?.id ?: -1)
-                    .put("active_tab_id", activeTab?.id ?: -1)
-                    .put("url", createdTab?.url ?: url)
-                    .put("tabs_count", tabs.size)
-                    .put("tabs", buildTabsJsonArray())
-                    .toString()
+                runOnMainSync { createdTab = createNewTab(url, true) }
+                Thread.sleep(300)
+                attachFreshStateAndDirective(JSONObject().put("status", "tab_created").put("tab_id", createdTab?.id ?: -1), "new_tab")
             }
-            "switch", "select", "activate" -> {
+            "switch", "select" -> {
                 val targetId = body?.optInt("tab_id", body.optInt("id", -1)) ?: -1
                 val idx = body?.optInt("index", -1) ?: -1
-                val query = body?.optString("title", body.optString("query", body.optString("url", ""))) ?: ""
+                val query = body?.optString("query", body.optString("title", "")) ?: ""
                 val targetTab = findTabByQuery(targetId, idx, query)
                 if (targetTab != null) {
                     runOnMainSync { switchToTab(targetTab) }
-                    JSONObject()
-                        .put("status", "switched")
-                        .put("active_tab_id", targetTab.id)
-                        .put("title", targetTab.title)
-                        .put("url", targetTab.url)
-                        .put("tabs", buildTabsJsonArray())
-                        .toString()
-                } else {
-                    JSONObject()
-                        .put("status", "error")
-                        .put("message", "Tab not found")
-                        .put("available_tabs", buildTabsJsonArray())
-                        .toString()
-                }
-            }
-            "next" -> {
-                if (tabs.size > 1 && activeTab != null) {
-                    val curIdx = tabs.indexOf(activeTab)
-                    val nextTab = tabs[(curIdx + 1) % tabs.size]
-                    runOnMainSync { switchToTab(nextTab) }
-                }
-                JSONObject().put("status", "switched").put("active_tab_id", activeTab?.id ?: -1).put("url", currentUrl).toString()
-            }
-            "prev", "previous" -> {
-                if (tabs.size > 1 && activeTab != null) {
-                    val curIdx = tabs.indexOf(activeTab)
-                    val prevTab = tabs[(curIdx - 1 + tabs.size) % tabs.size]
-                    runOnMainSync { switchToTab(prevTab) }
-                }
-                JSONObject().put("status", "switched").put("active_tab_id", activeTab?.id ?: -1).put("url", currentUrl).toString()
-            }
-            "close" -> {
-                val targetId = body?.optInt("tab_id", body.optInt("id", activeTab?.id ?: -1)) ?: (activeTab?.id ?: -1)
-                val targetTab = findTabByQuery(targetId)
-                if (targetTab != null) {
-                    runOnMainSync { closeTab(targetTab) }
-                    JSONObject()
-                        .put("status", "closed")
-                        .put("closed_tab_id", targetId)
-                        .put("active_tab_id", activeTab?.id ?: -1)
-                        .put("tabs", buildTabsJsonArray())
-                        .toString()
+                    Thread.sleep(200)
+                    attachFreshStateAndDirective(JSONObject().put("status", "switched").put("active_tab_id", targetTab.id), "switch_tab")
                 } else {
                     JSONObject().put("status", "error").put("message", "Tab not found").toString()
                 }
             }
-            else -> JSONObject().put("status", "error").put("message", "Unknown tab action: $action").toString()
+            "close" -> {
+                val targetId = body?.optInt("tab_id", activeTab?.id ?: -1) ?: -1
+                val targetTab = findTabByQuery(targetId)
+                if (targetTab != null) {
+                    runOnMainSync { closeTab(targetTab) }
+                    attachFreshStateAndDirective(JSONObject().put("status", "closed").put("closed_tab_id", targetId), "close_tab")
+                } else {
+                    JSONObject().put("status", "error").put("message", "Tab not found").toString()
+                }
+            }
+            else -> attachFreshStateAndDirective(JSONObject().put("status", "ok").put("tabs", buildTabsJsonArray()), "list_tabs")
         }
     }
 
@@ -1972,7 +1871,7 @@ class MainActivity : Activity() {
         appendLog("$method $path")
         setConsoleStatus("🟢 127.0.0.1:$SERVER_PORT | CMD: $method $path", false)
 
-        if (body != null && body.has("tab_id") && !path.startsWith("/tab") && path != "/close_tab" && path != "/switch_tab") {
+        if (body != null && body.has("tab_id") && !path.startsWith("/tab") && path != "/switch_tab") {
             val reqTabId = body.optInt("tab_id", -1)
             if (reqTabId > 0 && activeTab?.id != reqTabId) {
                 findTabByQuery(tabId = reqTabId)?.let { t ->
@@ -1984,21 +1883,40 @@ class MainActivity : Activity() {
 
         return when (path) {
             "/", "/status" -> {
-                JSONObject()
+                val res = JSONObject()
                     .put("status", "online")
-                    .put("browser", "Gemini Browser")
+                    .put("browser", "Gemini Autonomous Browser")
                     .put("port", SERVER_PORT)
+                    .put("cdp_enabled", true)
                     .put("active_tab_id", activeTab?.id ?: -1)
-                    .put("tabs_count", tabs.size)
                     .put("tabs", buildTabsJsonArray())
-                    .put("url", currentUrl)
-                    .put("title", currentTitle)
-                    .put("loading", isPageLoading)
-                    .put("network_idle", isNetworkIdle)
-                    .put("desktop_mode", desktopMode)
-                    .put("userscripts_count", getSavedUserScripts().length())
-                    .toString()
+                attachFreshStateAndDirective(res, "status")
             }
+
+            "/goal" -> {
+                activeGoalDescription = body?.optString("goal", activeGoalDescription) ?: activeGoalDescription
+                expectedTargetFilePath = body?.optString("expected_path", expectedTargetFilePath) ?: expectedTargetFilePath
+                expectedTargetContentLength = body?.optInt("expected_length", expectedTargetContentLength) ?: expectedTargetContentLength
+                attachFreshStateAndDirective(
+                    JSONObject()
+                        .put("status", "goal_registered")
+                        .put("goal", activeGoalDescription)
+                        .put("expected_path", expectedTargetFilePath)
+                        .put("expected_length", expectedTargetContentLength),
+                    "goal"
+                )
+            }
+
+            "/github_state" -> {
+                attachFreshStateAndDirective(JSONObject().put("status", "ok"), "github_state")
+            }
+
+            "/set_github_path", "/github_path" -> {
+                val targetPath = body?.optString("path", body.optString("file_path", "")) ?: ""
+                performSetGitHubPathSync(targetPath)
+            }
+
+            "/locator" -> performPlaywrightLocatorSync(body ?: JSONObject())
 
             "/verify", "/github_verify" -> performGitHubVerificationSync(body)
 
@@ -2013,32 +1931,23 @@ class MainActivity : Activity() {
             "/desktop" -> {
                 val enable = body?.optBoolean("enable", !desktopMode) ?: !desktopMode
                 applyDesktopMode(enable)
-                JSONObject().put("status", "ok").put("desktop_mode", desktopMode).toString()
-            }
-
-            "/download" -> {
-                val dlUrl = body?.optString("url", currentUrl) ?: currentUrl
-                runOnMainSync {
-                    startBrowserDownload(dlUrl, if (desktopMode) desktopUA else mobileUA, null, null)
-                }
-                JSONObject().put("status", "download_started").put("url", dlUrl).toString()
+                Thread.sleep(400)
+                attachFreshStateAndDirective(JSONObject().put("status", "ok").put("desktop_mode", desktopMode), "desktop")
             }
 
             "/navigate" -> {
                 val targetUrl = body?.optString("url", "https://gemini.google.com") ?: "https://gemini.google.com"
                 val waitIdle = body?.optBoolean("wait_idle", true) ?: true
-                val openInNewTab = body?.optBoolean("new_tab", false) ?: false
-                if (openInNewTab) {
-                    runOnMainSync { createNewTab(targetUrl, switchToIt = true) }
-                } else {
-                    if (body?.has("desktop_mode") == true) {
-                        val wantPc = body.optBoolean("desktop_mode", desktopMode)
-                        if (wantPc != desktopMode) applyDesktopMode(wantPc)
-                    }
-                    activeTab?.isPageLoading = true
-                    activeTab?.isNetworkIdle = false
-                    runOnMainSync { webView.loadUrl(targetUrl) }
+                if (body?.has("expected_path") == true) {
+                    expectedTargetFilePath = body.optString("expected_path", "")
                 }
+                if (body?.has("desktop_mode") == true) {
+                    val wantPc = body.optBoolean("desktop_mode", desktopMode)
+                    if (wantPc != desktopMode) applyDesktopMode(wantPc)
+                }
+                activeTab?.isPageLoading = true
+                activeTab?.isNetworkIdle = false
+                runOnMainSync { webView.loadUrl(targetUrl) }
                 if (waitIdle) {
                     val start = System.currentTimeMillis()
                     while (System.currentTimeMillis() - start < 8000) {
@@ -2046,13 +1955,11 @@ class MainActivity : Activity() {
                         Thread.sleep(200)
                     }
                 }
-                JSONObject()
-                    .put("status", "navigating")
-                    .put("tab_id", activeTab?.id ?: -1)
-                    .put("url", currentUrl)
-                    .put("title", currentTitle)
-                    .put("desktop_mode", desktopMode)
-                    .toString()
+                Thread.sleep(250)
+                attachFreshStateAndDirective(
+                    JSONObject().put("status", "navigated").put("url", currentUrl).put("title", currentTitle),
+                    "navigate"
+                )
             }
 
             "/dom" -> extractDomSync(true)
@@ -2066,13 +1973,7 @@ class MainActivity : Activity() {
                         return (clone.innerText || '').replace(/\n{3,}/g, '\n\n').trim();
                     })();
                 """.trimIndent())
-                JSONObject()
-                    .put("status", "ok")
-                    .put("tab_id", activeTab?.id ?: -1)
-                    .put("url", currentUrl)
-                    .put("title", currentTitle)
-                    .put("content", text)
-                    .toString()
+                attachFreshStateAndDirective(JSONObject().put("status", "ok").put("content", text), "reader")
             }
 
             "/ocr" -> {
@@ -2083,12 +1984,7 @@ class MainActivity : Activity() {
 
             "/screenshot" -> {
                 val b64 = captureViewportBase64Sync()
-                JSONObject()
-                    .put("status", "ok")
-                    .put("tab_id", activeTab?.id ?: -1)
-                    .put("url", currentUrl)
-                    .put("image_base64", b64)
-                    .toString()
+                JSONObject().put("status", "ok").put("url", currentUrl).put("image_base64", b64).toString()
             }
 
             "/click" -> {
@@ -2096,7 +1992,8 @@ class MainActivity : Activity() {
                 val rawX = body?.optDouble("x", -1.0)?.toFloat() ?: -1f
                 val rawY = body?.optDouble("y", -1.0)?.toFloat() ?: -1f
                 val matchText = body?.optString("text", "") ?: ""
-                performSmartClickSync(elId, rawX, rawY, matchText)
+                val contextFilter = body?.optString("context", "") ?: ""
+                performSmartClickSync(elId, rawX, rawY, matchText, contextFilter)
             }
 
             "/type" -> {
@@ -2135,59 +2032,23 @@ class MainActivity : Activity() {
                 performSelectSync(elId, value, text, index)
             }
 
-            "/userscript", "/eval" -> handleUserScriptApiSync(body ?: JSONObject())
-
             "/wait" -> {
                 val selector = body?.optString("selector", "") ?: ""
                 val timeoutMs = body?.optLong("timeout_ms", 10000L) ?: 10000L
                 waitForSelectorSync(selector, timeoutMs)
             }
 
-            "/upload" -> {
-                queuedFilePath = body?.optString("file_path", null)
-                JSONObject().put("status", "queued").put("file_path", queuedFilePath).toString()
-            }
-
             else -> JSONObject().put("status", "error").put("message", "Unknown endpoint: $path").toString()
         }
     }
 
-    private fun handleUserScriptApiSync(body: JSONObject): String {
-        val action = body.optString("action", "list").lowercase(Locale.ROOT)
-        val b64 = body.optString("code_b64", body.optString("text_b64", ""))
-        val code = if (b64.isNotEmpty()) {
-            try { String(Base64.decode(b64, Base64.DEFAULT), Charsets.UTF_8) } catch (_: Exception) { "" }
-        } else {
-            body.optString("code", body.optString("script", ""))
-        }
-        val name = body.optString("name", "API_UserScript")
-
-        return when (action) {
-            "list" -> JSONObject().put("status", "ok").put("scripts", getSavedUserScripts()).toString()
-            "add", "save" -> {
-                val arr = getSavedUserScripts()
-                arr.put(JSONObject().put("name", name).put("code", code).put("enabled", true))
-                saveUserScripts(arr)
-                runSingleUserScriptOnPage(webView, name, code)
-                JSONObject().put("status", "saved_and_executed").put("name", name).put("total_scripts", arr.length()).toString()
-            }
-            "run", "eval" -> {
-                val res = evalJsSync(code)
-                JSONObject().put("status", "executed").put("result", res).toString()
-            }
-            "clear" -> {
-                saveUserScripts(JSONArray())
-                JSONObject().put("status", "cleared_all_scripts").toString()
-            }
-            else -> JSONObject().put("status", "error").put("message", "Unknown userscript action: $action").toString()
-        }
-    }
+    // ==================== IMPROVEMENT 2: SEMANTIC DOM EXTRACTION WITH DIALOG CONTEXT ====================
 
     private fun extractDomSync(showBoxes: Boolean): String {
         val overlayW = overlayView.width.coerceAtLeast(1)
         val js = """
             (function() {
-                const selectors = 'a, button, input, select, textarea, [role="button"], [role="option"], [role="menuitem"], [role="textbox"], [role="code"], [contenteditable="true"], .monaco-editor, .cm-content, .ace_editor, [onclick], summary';
+                const selectors = 'a, button, input, select, textarea, [role="button"], [role="option"], [role="menuitem"], [role="textbox"], [role="code"], [contenteditable="true"], .monaco-editor, .cm-content, [onclick], summary';
                 const nodes = document.querySelectorAll(selectors);
                 const scale = $overlayW / (window.innerWidth || 1);
                 const list = [];
@@ -2206,31 +2067,23 @@ class MainActivity : Activity() {
                         const tag = el.tagName.toLowerCase();
                         const isEditor = el.classList.contains('monaco-editor') || el.classList.contains('cm-content') || el.getAttribute('contenteditable') === 'true';
 
-                        let rawLabel = '';
-                        let optionsPreview = null;
+                        const dlg = el.closest('[role="dialog"], dialog[open], .Overlay, .Box-overlay');
+                        const inOpenDialog = dlg !== null;
+                        const ctx = inOpenDialog ? 'dialog' : (el.closest('header, nav') ? 'nav' : 'main');
+                        const isDisabled = Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true');
 
-                        if (tag === 'select') {
-                            const selOpt = el.options && el.selectedIndex >= 0 ? el.options[el.selectedIndex] : null;
-                            rawLabel = selOpt ? (selOpt.text || selOpt.value || '') : '';
-                            const opts = [];
-                            if (el.options) {
-                                for (let i = 0; i < Math.min(el.options.length, 25); i++) {
-                                    opts.push((el.options[i].text || el.options[i].value || '').trim());
-                                }
-                            }
-                            optionsPreview = opts;
-                        } else {
-                            rawLabel = (el.innerText || el.value || el.placeholder || el.getAttribute('aria-label') || el.name || (isEditor ? 'Code Editor' : '')).replace(/\s+/g, ' ').trim();
-                            if (rawLabel.length <= 4 && el.parentElement) {
-                                const rowText = (el.parentElement.innerText || '').replace(/\s+/g, ' ').trim();
-                                if (rowText.length > rawLabel.length) rawLabel = rowText;
-                            }
-                        }
+                        let rawLabel = (el.innerText || el.value || el.placeholder || el.getAttribute('aria-label') || el.name || (isEditor ? 'Code Editor' : '')).replace(/\s+/g, ' ').trim();
 
-                        const itemObj = {
+                        list.push({
                             id: id,
-                            tag: isEditor ? 'code-editor' : (el.getAttribute('role') === 'option' ? 'dropdown-option' : tag),
-                            type: el.type || (tag === 'select' ? 'dropdown' : (isEditor ? 'monaco/codemirror' : '')),
+                            tag: isEditor ? 'code-editor' : tag,
+                            role: el.getAttribute('role') || tag,
+                            type: el.type || (isEditor ? 'monaco/codemirror' : ''),
+                            context: ctx,
+                            in_open_dialog: inOpenDialog,
+                            disabled: isDisabled,
+                            aria_label: (el.getAttribute('aria-label') || '').slice(0, 80),
+                            placeholder: (el.getAttribute('placeholder') || '').slice(0, 80),
                             text: rawLabel.slice(0, 140),
                             x: Math.round((r.left + r.width / 2) * scale),
                             y: Math.round((r.top + r.height / 2) * scale),
@@ -2240,9 +2093,7 @@ class MainActivity : Activity() {
                             bottom: Math.round(r.bottom * scale),
                             width: Math.round(r.width * scale),
                             height: Math.round(r.height * scale)
-                        };
-                        if (optionsPreview) itemObj.options = optionsPreview;
-                        list.push(itemObj);
+                        });
                     }
                 });
                 return JSON.stringify(list);
@@ -2250,11 +2101,7 @@ class MainActivity : Activity() {
         """.trimIndent()
 
         val jsonStr = evalJsSync(js)
-        val finalArr = try {
-            if (jsonStr.startsWith("[")) JSONArray(jsonStr) else JSONArray()
-        } catch (_: Exception) {
-            JSONArray()
-        }
+        val finalArr = try { if (jsonStr.startsWith("[")) JSONArray(jsonStr) else JSONArray() } catch (_: Exception) { JSONArray() }
 
         if (showBoxes && finalArr.length() > 0) {
             try {
@@ -2267,7 +2114,8 @@ class MainActivity : Activity() {
                         o.getDouble("right").toFloat(),
                         o.getDouble("bottom").toFloat()
                     )
-                    boxes.add(Pair(rect, "[${o.getInt("id")}]"))
+                    val prefix = if (o.optBoolean("in_open_dialog", false)) "D" else ""
+                    boxes.add(Pair(rect, "[$prefix${o.getInt("id")}]"))
                 }
                 runOnMainSync { overlayView.showDomBoxes(boxes) }
             } catch (_: Exception) {}
@@ -2280,47 +2128,38 @@ class MainActivity : Activity() {
                 JSONObject()
                     .put("id", 9000 + t.id)
                     .put("tag", "browser-tab")
-                    .put("type", if (isCur) "active_tab" else "switch_tab")
+                    .put("context", "browser")
+                    .put("in_open_dialog", false)
+                    .put("disabled", false)
                     .put("tab_id", t.id)
-                    .put("text", (if (isCur) "[ACTIVE TAB #${t.id}] " else "[SWITCH TO TAB #${t.id}] ") + t.title.take(40) + " (" + t.url.take(50) + ")")
+                    .put("text", (if (isCur) "[ACTIVE TAB #${t.id}] " else "[SWITCH TO TAB #${t.id}] ") + t.title.take(40))
                     .put("x", 0).put("y", 0).put("left", 0).put("top", 0).put("right", 0).put("bottom", 0).put("width", 0).put("height", 0)
             )
         }
-        finalArr.put(
-            JSONObject()
-                .put("id", 9099)
-                .put("tag", "browser-tab-new")
-                .put("type", "new_tab_button")
-                .put("text", "[+ NEW TAB] Open a new browser tab")
-                .put("x", 0).put("y", 0).put("left", 0).put("top", 0).put("right", 0).put("bottom", 0).put("width", 0).put("height", 0)
-        )
-
         return finalArr.toString()
     }
 
-    private fun performSmartClickSync(elementId: Int, rawX: Float, rawY: Float, matchText: String = ""): String {
+    // ==================== IMPROVEMENT 2B: SEMANTIC & DIALOG-AWARE SMART CLICK ====================
+
+    private fun performSmartClickSync(
+        elementId: Int,
+        rawX: Float,
+        rawY: Float,
+        matchText: String = "",
+        contextFilter: String = ""
+    ): String {
         evalJsSync("(function(){ if (window.__aiCommitActiveInput) window.__aiCommitActiveInput(); })()")
 
         if (elementId == 9099) {
             var created: BrowserTab? = null
             runOnMainSync { created = createNewTab("https://gemini.google.com", switchToIt = true) }
-            return JSONObject()
-                .put("status", "new_tab_opened")
-                .put("tab_id", created?.id ?: -1)
-                .put("tabs", buildTabsJsonArray())
-                .toString()
+            return attachFreshStateAndDirective(JSONObject().put("status", "new_tab_opened").put("tab_id", created?.id ?: -1), "click")
         }
         if (elementId in 9001..9098) {
-            val targetTabId = elementId - 9000
-            val targetTab = findTabByQuery(tabId = targetTabId)
+            val targetTab = findTabByQuery(tabId = elementId - 9000)
             if (targetTab != null) {
                 runOnMainSync { switchToTab(targetTab) }
-                return JSONObject()
-                    .put("status", "switched_tab")
-                    .put("active_tab_id", targetTab.id)
-                    .put("title", targetTab.title)
-                    .put("url", targetTab.url)
-                    .toString()
+                return attachFreshStateAndDirective(JSONObject().put("status", "switched_tab").put("active_tab_id", targetTab.id), "click")
             }
         }
 
@@ -2328,95 +2167,62 @@ class MainActivity : Activity() {
         val wvW = webView.width.coerceAtLeast(1)
         val wvScaleRatio = wvW.toFloat() / overlayW.toFloat()
 
-        if (matchText.isNotEmpty()) {
-            val lowerMatch = matchText.trim().lowercase(Locale.ROOT)
-            if (lowerMatch.startsWith("switch to tab") || lowerMatch.startsWith("[switch to tab") || Regex("^tab\\s*#?\\d+$").matches(lowerMatch)) {
-                val tabTarget = findTabByQuery(query = lowerMatch)
-                if (tabTarget != null) {
-                    runOnMainSync { switchToTab(tabTarget) }
-                    return JSONObject()
-                        .put("status", "switched_tab")
-                        .put("active_tab_id", tabTarget.id)
-                        .put("url", tabTarget.url)
-                        .toString()
-                }
-            }
-
+        // Semantic Text Click with Automatic Open-Dialog Prioritization!
+        if (matchText.isNotEmpty() && elementId <= 0) {
             val safeTarget = matchText.replace("\\", "\\\\").replace("'", "\\'")
+            val safeCtx = contextFilter.replace("'", "\\'").lowercase(Locale.ROOT)
             val textClickRes = evalJsSync("""
                 (function() {
                     if (window.__aiCommitActiveInput) window.__aiCommitActiveInput();
                     const q = '$safeTarget'.trim().toLowerCase();
-                    const selects = document.querySelectorAll('select');
-                    for (let s = 0; s < selects.length; s++) {
-                        const sel = selects[s];
-                        for (let i = 0; i < sel.options.length; i++) {
-                            const opt = sel.options[i];
-                            const txt = (opt.text || opt.label || opt.value || '').trim().toLowerCase();
-                            if (txt === q || txt.includes(q)) {
-                                sel.selectedIndex = i;
-                                sel.value = opt.value;
-                                sel.dispatchEvent(new Event('focus', { bubbles: true }));
-                                sel.dispatchEvent(new Event('input', { bubbles: true }));
-                                sel.dispatchEvent(new Event('change', { bubbles: true }));
-                                if (window.jQuery) { try { window.jQuery(sel).trigger('change'); } catch(e){} }
-                                const modal = document.getElementById('__ai_select_modal');
-                                if (modal) modal.remove();
-                                return JSON.stringify({ status: 'selected_option', option_text: opt.text, index: i, value: opt.value });
-                            }
-                        }
-                    }
-                    const nodes = document.querySelectorAll('[role="option"], [role="menuitem"], button, a, input[type="submit"], input[type="button"], [role="button"], span, div');
-                    for (let i = nodes.length - 1; i >= 0; i--) {
-                        const el = nodes[i];
-                        const t = (el.innerText || el.value || el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
-                        if (t === q) {
-                            el.scrollIntoView({ behavior: 'instant', block: 'center' });
-                            el.click();
-                            return JSON.stringify({ status: 'clicked_by_text', text: t });
-                        }
-                    }
-                    return '';
-                })();
-            """.trimIndent())
-            if (textClickRes.startsWith("{")) return textClickRes
-        }
+                    const nodes = Array.from(document.querySelectorAll('button, a, input[type="submit"], input[type="button"], [role="button"], [role="menuitem"], [role="option"], summary, span'));
+                    const matches = [];
+                    for (const el of nodes) {
+                        const r = el.getBoundingClientRect();
+                        const s = window.getComputedStyle(el);
+                        if (r.width <= 4 || r.height <= 4 || s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') continue;
+                        if (el.disabled || el.getAttribute('aria-disabled') === 'true') continue;
 
-        var screenX = rawX
-        var screenY = rawY
-        var targetRect: RectF? = null
+                        const t = (el.innerText || el.value || el.getAttribute('aria-label') || el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                        const inDialog = el.closest('[role="dialog"], dialog[open], .Overlay, .Box-overlay') !== null;
+                        if ('$safeCtx' === 'dialog' && !inDialog) continue;
 
-        if (elementId > 0) {
-            val specialCheck = evalJsSync("""
-                (function() {
-                    const el = document.querySelector('[data-ai-id="$elementId"]');
-                    if (!el) return '';
-                    if (el.getAttribute('role') === 'option' && el.hasAttribute('data-ai-select-index')) {
-                        const txt = (el.innerText || '').trim();
-                        el.click();
-                        return JSON.stringify({ status: 'selected_dropdown_option', element_id: $elementId, selected_text: txt });
-                    }
-                    if (el.tagName.toLowerCase() === 'select') {
-                        if (window.__aiOpenSelectModal) window.__aiOpenSelectModal(el);
-                        const opts = [];
-                        for (let i = 0; i < el.options.length; i++) {
-                            opts.push({ index: i, text: (el.options[i].text || '').trim(), value: el.options[i].value });
+                        if (t === q || t.includes(q)) {
+                            let score = (t === q) ? 100 : 40;
+                            // Crucial: If a modal dialog is open, strongly prefer buttons inside the dialog!
+                            if (inDialog) score += 200;
+                            if (el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') score += 30;
+                            matches.push({ el: el, score: score, text: t, in_dialog: inDialog });
                         }
+                    }
+                    matches.sort((a, b) => b.score - a.score);
+                    if (matches.length > 0) {
+                        const best = matches[0];
+                        best.el.scrollIntoView({ behavior: 'instant', block: 'center' });
+                        best.el.click();
                         return JSON.stringify({
-                            status: 'select_dropdown_opened',
-                            element_id: $elementId,
-                            options: opts
+                            status: 'clicked_by_semantic_text',
+                            clicked_text: best.text,
+                            in_open_dialog: best.in_dialog,
+                            candidates_found: matches.length
                         });
                     }
                     return '';
                 })();
             """.trimIndent())
 
-            if (specialCheck.startsWith("{")) {
-                extractDomSync(true)
-                return specialCheck
+            if (textClickRes.startsWith("{")) {
+                Thread.sleep(350)
+                return attachFreshStateAndDirective(JSONObject(textClickRes), "click")
             }
+        }
 
+        var screenX = rawX
+        var screenY = rawY
+        var targetRect: RectF? = null
+        var clickedMeta = JSONObject()
+
+        if (elementId > 0) {
             val js = """
                 (function() {
                     const el = document.querySelector('[data-ai-id="$elementId"]');
@@ -2424,37 +2230,55 @@ class MainActivity : Activity() {
                     el.scrollIntoView({ behavior: 'instant', block: 'center', inline: 'center' });
                     const r = el.getBoundingClientRect();
                     const scale = $overlayW / (window.innerWidth || 1);
+                    const inDialog = el.closest('[role="dialog"], dialog[open], .Overlay, .Box-overlay') !== null;
+                    const disabled = Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true');
                     return JSON.stringify({
                         x: (r.left + r.width / 2) * scale,
                         y: (r.top + r.height / 2) * scale,
                         l: r.left * scale,
                         t: r.top * scale,
                         r: r.right * scale,
-                        b: r.bottom * scale
+                        b: r.bottom * scale,
+                        tag: el.tagName.toLowerCase(),
+                        text: (el.innerText || el.value || el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim().slice(0, 80),
+                        in_open_dialog: inDialog,
+                        disabled: disabled
                     });
                 })();
             """.trimIndent()
             val posStr = evalJsSync(js)
-            Thread.sleep(150)
-            if (posStr.isNotEmpty() && posStr != "null") {
-                val obj = JSONObject(posStr)
-                screenX = obj.getDouble("x").toFloat()
-                screenY = obj.getDouble("y").toFloat()
+            Thread.sleep(120)
+            if (posStr.isNotEmpty() && posStr.startsWith("{")) {
+                clickedMeta = JSONObject(posStr)
+                if (clickedMeta.optBoolean("disabled", false)) {
+                    return attachFreshStateAndDirective(
+                        JSONObject()
+                            .put("status", "click_blocked_element_disabled")
+                            .put("element_id", elementId)
+                            .put("element_info", clickedMeta),
+                        "click"
+                    )
+                }
+                screenX = clickedMeta.getDouble("x").toFloat()
+                screenY = clickedMeta.getDouble("y").toFloat()
                 targetRect = RectF(
-                    obj.getDouble("l").toFloat(),
-                    obj.getDouble("t").toFloat(),
-                    obj.getDouble("r").toFloat(),
-                    obj.getDouble("b").toFloat()
+                    clickedMeta.getDouble("l").toFloat(),
+                    clickedMeta.getDouble("t").toFloat(),
+                    clickedMeta.getDouble("r").toFloat(),
+                    clickedMeta.getDouble("b").toFloat()
                 )
             } else {
-                return JSONObject().put("status", "error").put("message", "Element [$elementId] not found").toString()
+                return attachFreshStateAndDirective(
+                    JSONObject().put("status", "error").put("message", "Element [$elementId] not found in current DOM"),
+                    "click"
+                )
             }
         }
 
         val urlBeforeClick = currentUrl
         val wvTouchX = screenX * wvScaleRatio
         val wvTouchY = screenY * wvScaleRatio
-        val holdMs = (55..110).random().toLong()
+        val holdMs = (55..95).random().toLong()
 
         runOnMainSync {
             webView.requestFocus()
@@ -2473,188 +2297,51 @@ class MainActivity : Activity() {
                 (function() {
                     const el = document.querySelector('[data-ai-id="$elementId"]');
                     if (!el) return;
-                    if (el.classList.contains('monaco-editor')) {
-                        const ta = el.querySelector('textarea.inputarea') || el.querySelector('textarea');
-                        if (ta) ta.focus(); else el.focus();
-                    } else {
-                        el.focus();
+                    el.focus();
+                    // Also trigger synthetic click if it's a button inside a modal dialog to guarantee activation
+                    if (el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') {
+                        el.click();
                     }
                 })();
             """.trimIndent())
         }
 
-        Thread.sleep(holdMs + 120)
-        return JSONObject()
+        // Wait 350ms for modal dialog or navigation transition before capturing fresh DOM state
+        Thread.sleep(holdMs + 300)
+
+        val res = JSONObject()
             .put("status", "clicked")
-            .put("note", "Click dispatched. For GitHub commits or Actions, call /verify to confirm actual commit_sha, file_path, content & run logs.")
-            .put("tab_id", activeTab?.id ?: -1)
             .put("element_id", elementId)
+            .put("clicked_meta", clickedMeta)
             .put("url_before", urlBeforeClick)
             .put("url_after", currentUrl)
-            .put("x", screenX)
-            .put("y", screenY)
-            .toString()
+        return attachFreshStateAndDirective(res, "click")
     }
 
-    private fun performSelectSync(elementId: Int, value: String, text: String, index: Int): String {
-        val safeVal = value.replace("\\", "\\\\").replace("'", "\\'")
-        val safeTxt = text.replace("\\", "\\\\").replace("'", "\\'")
-        return evalJsSync("""
-            (function() {
-                let el = $elementId > 0 ? document.querySelector('[data-ai-id="$elementId"]') : document.querySelector('select');
-                if (!el || el.tagName.toLowerCase() !== 'select') return JSON.stringify({ status: 'error', message: 'Select element not found' });
-                let chosenIdx = $index;
-                if (chosenIdx < 0) {
-                    const q = ('$safeTxt' || '$safeVal').trim().toLowerCase();
-                    for (let i = 0; i < el.options.length; i++) {
-                        const ot = (el.options[i].text || el.options[i].value || '').trim().toLowerCase();
-                        if (ot === q || ot.includes(q)) { chosenIdx = i; break; }
-                    }
-                }
-                if (chosenIdx >= 0 && chosenIdx < el.options.length) {
-                    el.selectedIndex = chosenIdx;
-                    el.value = el.options[chosenIdx].value;
-                    el.dispatchEvent(new Event('focus', { bubbles: true }));
-                    el.dispatchEvent(new Event('input', { bubbles: true }));
-                    el.dispatchEvent(new Event('change', { bubbles: true }));
-                    const modal = document.getElementById('__ai_select_modal');
-                    if (modal) modal.remove();
-                    return JSON.stringify({ status: 'selected', selected_index: chosenIdx, selected_text: el.options[chosenIdx].text });
-                }
-                return JSON.stringify({ status: 'option_not_found' });
-            })();
-        """.trimIndent())
-    }
-
-    private fun performHumanTypingSync(elementId: Int, text: String, clear: Boolean, submit: Boolean, instant: Boolean): String {
-        if (elementId > 0) {
-            performSmartClickSync(elementId, -1f, -1f)
-            Thread.sleep(150)
-        } else {
-            runOnMainSync { webView.requestFocus() }
-        }
-
-        if (clear) {
-            if (elementId > 0) {
-                evalJsSync("""
-                    (function() {
-                        const el = document.querySelector('[data-ai-id="$elementId"]');
-                        if (el && window.__aiSetReactSafeValue) window.__aiSetReactSafeValue(el, '', '', false);
-                    })();
-                """.trimIndent())
-            } else {
-                performCodeEditorActionSync(JSONObject().put("action", "clear"))
-            }
-        }
-
-        if (instant) {
-            if (elementId > 0) {
-                val b64 = Base64.encodeToString(text.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
-                val res = evalJsSync("""
-                    (function() {
-                        const bin = atob('$b64');
-                        const bytes = new Uint8Array(bin.length);
-                        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-                        const decoded = new TextDecoder('utf-8').decode(bytes);
-                        const el = document.querySelector('[data-ai-id="$elementId"]') || document.activeElement;
-                        if (el && window.__aiSetReactSafeValue) {
-                            window.__aiSetReactSafeValue(el, decoded, decoded, false);
-                            return JSON.stringify({ status: 'typed_instant', length: decoded.length, value: el.value || el.innerText || '' });
-                        }
-                        return '';
-                    })();
-                """.trimIndent())
-                if (res.startsWith("{")) return res
-            }
-            return performCodeEditorActionSync(JSONObject().put("action", "insert").put("text", text))
-        }
-
-        for (i in 0 until text.length) {
-            if (isEmergencyStopped.get()) return JSONObject().put("status", "stopped").toString()
-            val ch = text[i]
-            val safe = ch.toString()
-                .replace("\\", "\\\\")
-                .replace("'", "\\'")
-                .replace("\n", "\\n")
-                .replace("\r", "")
-
-            val js = """
-                (function() {
-                    if (window.monaco && window.monaco.editor) {
-                        const editors = window.monaco.editor.getEditors ? window.monaco.editor.getEditors() : [];
-                        if (editors.length > 0 && editors[0].hasTextFocus && editors[0].hasTextFocus()) {
-                            editors[0].trigger('keyboard', 'type', { text: '$safe' });
-                            return 'monaco';
-                        }
-                    }
-
-                    let el = $elementId > 0 ? document.querySelector('[data-ai-id="$elementId"]') : document.activeElement;
-                    if (!el || el === document.body) {
-                        el = document.querySelector('.cm-content[contenteditable="true"], .monaco-editor textarea.inputarea, [contenteditable="true"], input:focus, textarea:focus, input:not([type="hidden"]), textarea');
-                    }
-                    if (!el) return 'no_element';
-
-                    el.focus();
-                    el.dispatchEvent(new KeyboardEvent('keydown', { key: '$safe', bubbles: true, cancelable: true }));
-
-                    if (window.__aiSetReactSafeValue) {
-                        window.__aiSetReactSafeValue(el, null, '$safe', true);
-                    } else if ('value' in el) {
-                        const prev = el.value || '';
-                        const proto = el.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
-                        const desc = Object.getOwnPropertyDescriptor(proto, 'value');
-                        const nextVal = prev + '$safe';
-                        if (desc && desc.set) desc.set.call(el, nextVal); else el.value = nextVal;
-                        if (el._valueTracker) { try { el._valueTracker.setValue(prev); } catch (e) {} }
-                        el.dispatchEvent(new InputEvent('input', { data: '$safe', inputType: 'insertText', bubbles: true }));
-                        el.dispatchEvent(new Event('change', { bubbles: true }));
-                    }
-
-                    el.dispatchEvent(new KeyboardEvent('keyup', { key: '$safe', bubbles: true }));
-                    return 'ok';
-                })();
-            """.trimIndent()
-            evalJsSync(js)
-            Thread.sleep((28..72).random().toLong())
-        }
-
-        val finalRead = evalJsSync("""
-            (function() {
-                let el = $elementId > 0 ? document.querySelector('[data-ai-id="$elementId"]') : document.activeElement;
-                if (!el) return '';
-                el.dispatchEvent(new Event('input', { bubbles: true }));
-                el.dispatchEvent(new Event('change', { bubbles: true }));
-                return (el.value !== undefined ? el.value : (el.innerText || '')).slice(0, 140);
-            })();
-        """.trimIndent())
-
-        if (submit) {
-            performSpecialKeySync("Enter")
-            evalJsSync("(function(){ const el = document.activeElement; if (el && el.form) el.form.submit(); })()")
-        }
-
-        return JSONObject()
-            .put("status", "typed")
-            .put("tab_id", activeTab?.id ?: -1)
-            .put("element_id", elementId)
-            .put("length", text.length)
-            .put("verified_input_value", finalRead)
-            .put("submitted", submit)
-            .toString()
-    }
+    // ==================== IMPROVEMENT 1 (P0): BULLETPROOF 4-STAGE EDITOR SET_CODE + READ-BACK VERIFICATION ====================
 
     private fun performCodeEditorActionSync(body: JSONObject): String {
         val action = body.optString("action", "get_code").lowercase(Locale.ROOT)
+        val filePathParam = body.optString("file_path", body.optString("path", ""))
         val inputB64 = body.optString("text_b64", "")
-        val text = if (inputB64.isNotEmpty()) {
+        val rawInputText = if (inputB64.isNotEmpty()) {
             try { String(Base64.decode(inputB64, Base64.DEFAULT), Charsets.UTF_8) } catch (_: Exception) { "" }
         } else {
             body.optString("text", "")
         }
+
+        // Normalize CRLF -> LF for clean comparison
+        val text = rawInputText.replace("\r\n", "\n")
         val line = body.optInt("line", 1)
         val b64Text = Base64.encodeToString(text.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
 
+        if (filePathParam.isNotEmpty()) {
+            performSetGitHubPathSync(filePathParam)
+        }
+
         if ((action == "paste" || action == "set_code" || action == "insert") && text.isNotEmpty()) {
+            expectedTargetContentLength = text.length
+            expectedTargetContentSha256 = sha256Hex(text)
             runOnMainSync {
                 val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                 cm.setPrimaryClip(ClipData.newPlainText("ai_paste", text))
@@ -2675,23 +2362,29 @@ class MainActivity : Activity() {
                 }
                 const rawText = decodeB64Utf8('$b64Text');
 
+                // Deep scan for CodeMirror 6 EditorView instance across all DOM nodes
                 function findCmView() {
                     const nodes = document.querySelectorAll('.cm-editor, .cm-content, .cm-scroller, .cm-line');
                     for (let i = 0; i < nodes.length; i++) {
-                        const cv = nodes[i].cmView;
-                        if (!cv) continue;
-                        if (cv.view && typeof cv.view.dispatch === 'function' && cv.view.state) return cv.view;
-                        if (cv.rootView && cv.rootView.view && typeof cv.rootView.view.dispatch === 'function') return cv.rootView.view;
-                        const keys1 = Object.keys(cv);
-                        for (let j = 0; j < keys1.length; j++) {
-                            const v1 = cv[keys1[j]];
-                            if (v1 && typeof v1 === 'object') {
-                                if (typeof v1.dispatch === 'function' && v1.state && v1.state.doc) return v1;
-                                const keys2 = Object.keys(v1);
-                                for (let k = 0; k < keys2.length; k++) {
-                                    const v2 = v1[keys2[k]];
-                                    if (v2 && typeof v2 === 'object' && typeof v2.dispatch === 'function' && v2.state && v2.state.doc) {
-                                        return v2;
+                        const n = nodes[i];
+                        const hooks = [n.cmView, n.cmTile, n.__cmView];
+                        for (const cv of hooks) {
+                            if (!cv) continue;
+                            if (cv.view && typeof cv.view.dispatch === 'function' && cv.view.state) return cv.view;
+                            if (cv.rootView && cv.rootView.view && typeof cv.rootView.view.dispatch === 'function') return cv.rootView.view;
+                            if (cv.root && cv.root.view && typeof cv.root.view.dispatch === 'function') return cv.root.view;
+                            const keys1 = Object.keys(cv);
+                            for (let j = 0; j < keys1.length; j++) {
+                                const v1 = cv[keys1[j]];
+                                if (v1 && typeof v1 === 'object') {
+                                    if (typeof v1.dispatch === 'function' && v1.state && v1.state.doc) return v1;
+                                    if (v1.view && typeof v1.view.dispatch === 'function' && v1.view.state) return v1.view;
+                                    const keys2 = Object.keys(v1);
+                                    for (let k = 0; k < keys2.length; k++) {
+                                        const v2 = v1[keys2[k]];
+                                        if (v2 && typeof v2 === 'object' && typeof v2.dispatch === 'function' && v2.state && v2.state.doc) {
+                                            return v2;
+                                        }
                                     }
                                 }
                             }
@@ -2704,113 +2397,359 @@ class MainActivity : Activity() {
                 const cmContent = document.querySelector('.cm-content[contenteditable="true"]');
                 const monacoModels = (window.monaco && window.monaco.editor && window.monaco.editor.getModels)
                     ? window.monaco.editor.getModels() : [];
-                const monacoEditors = (window.monaco && window.monaco.editor && window.monaco.editor.getEditors)
-                    ? window.monaco.editor.getEditors() : [];
 
                 let target = document.activeElement;
-                if (!target || target === document.body) {
-                    target = cmContent || document.querySelector('.monaco-editor textarea.inputarea, [contenteditable="true"], textarea, input:not([type="hidden"])');
+                if (!target || target === document.body || target.tagName === 'INPUT') {
+                    target = cmContent || document.querySelector('.monaco-editor textarea.inputarea, [contenteditable="true"], textarea');
                     if (target) target.focus();
                 }
 
                 function readCurrentCode() {
-                    if (monacoModels.length > 0) return monacoModels[0].getValue();
-                    if (cmView) return cmView.state.doc.toString();
-                    if (cmContent) return cmContent.innerText || '';
-                    if (target && 'value' in target) return target.value || '';
-                    if (target && target.isContentEditable) return target.innerText || '';
+                    if (monacoModels.length > 0) return (monacoModels[0].getValue() || '').replace(/\r\n/g, '\n');
+                    if (cmView) return (cmView.state.doc.toString() || '').replace(/\r\n/g, '\n');
+                    if (cmContent) {
+                        const lines = cmContent.querySelectorAll('.cm-line');
+                        if (lines.length > 0) {
+                            const arr = [];
+                            lines.forEach(l => arr.push((l.innerText || l.textContent || '').replace(/\u200B/g, '').replace(/\r?\n/g, '')));
+                            return arr.join('\n');
+                        }
+                        return (cmContent.innerText || '').replace(/\r\n/g, '\n');
+                    }
+                    if (target && 'value' in target) return (target.value || '').replace(/\r\n/g, '\n');
+                    if (target && target.isContentEditable) return (target.innerText || '').replace(/\r\n/g, '\n');
                     return '';
                 }
 
-                function writeFullCode(newCode) {
-                    if (monacoModels.length > 0) {
-                        monacoModels[0].setValue(newCode);
-                        return 'monaco_model';
-                    }
+                // Multi-Strategy Writer with Automatic Read-Back Verification Loop
+                function writeFullCodeAndVerify(newCode) {
+                    const attemptsLog = [];
+
+                    // Strategy 1: CodeMirror 6 Direct State Transaction (Atomic, handles 10,000+ lines)
                     if (cmView) {
-                        cmView.dispatch({
-                            changes: { from: 0, to: cmView.state.doc.length, insert: newCode },
-                            selection: { anchor: newCode.length }
-                        });
-                        return 'codemirror6_dispatch';
+                        try {
+                            cmView.dispatch({
+                                changes: { from: 0, to: cmView.state.doc.length, insert: newCode },
+                                selection: { anchor: newCode.length }
+                            });
+                            const rb1 = readCurrentCode();
+                            attemptsLog.push({ strategy: 'codemirror6_dispatch', length: rb1.length });
+                            if (rb1.trim() === newCode.trim()) return { engine: 'codemirror6_dispatch', attempts: attemptsLog };
+                        } catch (e) {
+                            attemptsLog.push({ strategy: 'codemirror6_dispatch_error', msg: String(e) });
+                        }
                     }
-                    if (target && window.__aiSetReactSafeValue) {
-                        return window.__aiSetReactSafeValue(target, newCode, newCode, false);
+
+                    // Strategy 2: Monaco Model setValue
+                    if (monacoModels.length > 0) {
+                        try {
+                            monacoModels[0].setValue(newCode);
+                            const rb2 = readCurrentCode();
+                            attemptsLog.push({ strategy: 'monaco_model', length: rb2.length });
+                            if (rb2.trim() === newCode.trim()) return { engine: 'monaco_model', attempts: attemptsLog };
+                        } catch (e) {}
                     }
-                    return 'none';
+
+                    // Strategy 3: Synthetic DataTransfer ClipboardEvent('paste') on .cm-content
+                    // (Avoids execCommand('insertText') 25-char first-line truncation on multiline YAML!)
+                    const editNode = cmContent || target;
+                    if (editNode) {
+                        try {
+                            editNode.focus();
+                            const sel = window.getSelection();
+                            const range = document.createRange();
+                            range.selectNodeContents(editNode);
+                            sel.removeAllRanges();
+                            sel.addRange(range);
+                            document.execCommand('delete', false, null);
+
+                            if (newCode.length > 0) {
+                                const dt = new DataTransfer();
+                                dt.setData('text/plain', newCode);
+                                const pasteEvent = new ClipboardEvent('paste', {
+                                    clipboardData: dt,
+                                    bubbles: true,
+                                    cancelable: true,
+                                    composed: true
+                                });
+                                editNode.dispatchEvent(pasteEvent);
+
+                                const rb3 = readCurrentCode();
+                                attemptsLog.push({ strategy: 'clipboard_paste_event', length: rb3.length });
+                                if (rb3.trim() === newCode.trim() || Math.abs(rb3.length - newCode.length) <= 5) {
+                                    return { engine: 'clipboard_paste_event', attempts: attemptsLog };
+                                }
+
+                                // Strategy 3B: InputEvent('beforeinput', { inputType: 'insertFromPaste', dataTransfer })
+                                const beforeInp = new InputEvent('beforeinput', {
+                                    inputType: 'insertFromPaste',
+                                    data: newCode,
+                                    dataTransfer: dt,
+                                    bubbles: true,
+                                    cancelable: true,
+                                    composed: true
+                                });
+                                editNode.dispatchEvent(beforeInp);
+                                const rb3b = readCurrentCode();
+                                attemptsLog.push({ strategy: 'beforeinput_insertFromPaste', length: rb3b.length });
+                                if (rb3b.trim() === newCode.trim() || Math.abs(rb3b.length - newCode.length) <= 5) {
+                                    return { engine: 'beforeinput_insertFromPaste', attempts: attemptsLog };
+                                }
+                            } else {
+                                return { engine: 'cleared_dom', attempts: attemptsLog };
+                            }
+                        } catch (e) {
+                            attemptsLog.push({ strategy: 'paste_error', msg: String(e) });
+                        }
+                    }
+
+                    // Strategy 4: Direct .cm-line DOM reconstruction for CodeMirror 6 if paste was blocked
+                    if (cmContent && newCode.length > 0) {
+                        try {
+                            cmContent.focus();
+                            cmContent.innerHTML = '';
+                            const lines = newCode.split('\n');
+                            for (let i = 0; i < lines.length; i++) {
+                                const div = document.createElement('div');
+                                div.className = 'cm-line';
+                                if (lines[i].length === 0) {
+                                    div.appendChild(document.createElement('br'));
+                                } else {
+                                    div.textContent = lines[i];
+                                }
+                                cmContent.appendChild(div);
+                            }
+                            cmContent.dispatchEvent(new InputEvent('input', { inputType: 'insertFromPaste', data: newCode, bubbles: true }));
+                            cmContent.dispatchEvent(new Event('change', { bubbles: true }));
+                            const rb4 = readCurrentCode();
+                            attemptsLog.push({ strategy: 'cm_line_dom_rebuild', length: rb4.length });
+                            return { engine: 'cm_line_dom_rebuild', attempts: attemptsLog };
+                        } catch (e) {}
+                    }
+
+                    // Strategy 5: Standard Textarea / React Safe Value
+                    if (target && 'value' in target && window.__aiSetReactSafeValue) {
+                        window.__aiSetReactSafeValue(target, newCode, newCode, false);
+                        return { engine: 'react_safe_textarea', attempts: attemptsLog };
+                    }
+
+                    return { engine: 'fallback_failed', attempts: attemptsLog };
                 }
 
                 if (action === 'get_code' || action === 'copy') {
                     const code = readCurrentCode();
-                    return JSON.stringify({ status: 'ok', action: action, length: code.length, content: code });
-                }
-
-                if (action === 'set_code') {
-                    const usedEngine = writeFullCode(rawText);
-                    const actual = readCurrentCode();
                     return JSON.stringify({
                         status: 'ok',
-                        engine: usedEngine,
+                        action: action,
+                        actual_length: code.length,
+                        lines_count: code ? code.split('\n').length : 0,
+                        content: code
+                    });
+                }
+
+                if (action === 'set_code' || action === 'insert' || action === 'paste') {
+                    const writeRes = writeFullCodeAndVerify(rawText);
+                    const actual = readCurrentCode();
+                    const exactMatch = (actual === rawText);
+                    const normalizedMatch = (actual.trim() === rawText.trim());
+                    const lengthDiff = Math.abs(actual.length - rawText.length);
+
+                    // Find first mismatch index for debugging if not exact
+                    let firstDiffAt = -1;
+                    if (!exactMatch) {
+                        const minL = Math.min(actual.length, rawText.length);
+                        for (let i = 0; i < minL; i++) {
+                            if (actual[i] !== rawText[i]) { firstDiffAt = i; break; }
+                        }
+                        if (firstDiffAt === -1 && actual.length !== rawText.length) firstDiffAt = minL;
+                    }
+
+                    return JSON.stringify({
+                        status: (exactMatch || normalizedMatch) ? 'verified_exact_match' : 'mismatch_detected',
+                        verified: (exactMatch || normalizedMatch),
+                        exact_match: exactMatch,
+                        normalized_match: normalizedMatch,
+                        engine: writeRes.engine,
+                        attempts: writeRes.attempts,
                         expected_length: rawText.length,
                         actual_length: actual.length,
-                        preview: actual.slice(0, 120)
+                        length_diff: lengthDiff,
+                        expected_lines: rawText ? rawText.split('\n').length : 0,
+                        actual_lines: actual ? actual.split('\n').length : 0,
+                        first_mismatch_index: firstDiffAt,
+                        readback_preview_start: actual.slice(0, 200),
+                        readback_preview_end: actual.slice(Math.max(0, actual.length - 200)),
+                        readback_full: actual
                     });
                 }
 
                 if (action === 'clear') {
-                    const usedEngine = writeFullCode('');
+                    const writeRes = writeFullCodeAndVerify('');
                     const actual = readCurrentCode();
                     return JSON.stringify({
-                        status: 'cleared',
-                        engine: usedEngine,
+                        status: actual.trim().length === 0 ? 'cleared' : 'unverified',
+                        verified: actual.trim().length === 0,
                         actual_length: actual.length
                     });
-                }
-
-                if (action === 'insert' || action === 'paste') {
-                    let usedEngine = 'react_safe_insert';
-                    if (monacoEditors.length > 0 && monacoEditors[0].hasTextFocus && monacoEditors[0].hasTextFocus()) {
-                        monacoEditors[0].trigger('keyboard', 'type', { text: rawText });
-                        usedEngine = 'monaco_trigger';
-                    } else if (cmView) {
-                        const mainSel = cmView.state.selection.main;
-                        cmView.dispatch({
-                            changes: { from: mainSel.from, to: mainSel.to, insert: rawText },
-                            selection: { anchor: mainSel.from + rawText.length }
-                        });
-                        usedEngine = 'codemirror6_insert';
-                    } else if (target && window.__aiSetReactSafeValue) {
-                        usedEngine = window.__aiSetReactSafeValue(target, rawText, rawText, true);
-                    }
-                    const actual = readCurrentCode();
-                    return JSON.stringify({
-                        status: 'ok',
-                        engine: usedEngine,
-                        inserted_length: rawText.length,
-                        actual_length: actual.length,
-                        preview: actual.slice(0, 120)
-                    });
-                }
-
-                if (action === 'goto_line') {
-                    if (monacoEditors.length > 0) {
-                        monacoEditors[0].revealLineInCenter($line);
-                        monacoEditors[0].setPosition({ lineNumber: $line, column: 1 });
-                        return JSON.stringify({ status: 'moved', line: $line });
-                    }
-                    if (cmView) {
-                        const maxLines = cmView.state.doc.lines;
-                        const targetLine = Math.min(Math.max(1, $line), maxLines);
-                        const lineInfo = cmView.state.doc.line(targetLine);
-                        cmView.dispatch({ selection: { anchor: lineInfo.from }, scrollIntoView: true });
-                        return JSON.stringify({ status: 'moved', line: targetLine });
-                    }
                 }
 
                 return JSON.stringify({ status: 'ok', content: readCurrentCode() });
             })();
         """.trimIndent()
-        return evalJsSync(js)
+
+        val rawRes = evalJsSync(js)
+        val resObj = try { if (rawRes.startsWith("{")) JSONObject(rawRes) else JSONObject().put("status", "error") } catch (_: Exception) { JSONObject() }
+        if (resObj.has("readback_full")) {
+            val rbFull = resObj.optString("readback_full", "")
+            resObj.put("sha256_expected", sha256Hex(text))
+            resObj.put("sha256_actual", sha256Hex(rbFull))
+            // Keep response compact if content is huge, but keep full readback up to 4000 chars
+            if (rbFull.length > 4000) {
+                resObj.put("readback_full", rbFull.take(4000) + "...[truncated]")
+            }
+        }
+        return attachFreshStateAndDirective(resObj, "editor_$action")
+    }
+
+    private fun performSelectSync(elementId: Int, value: String, text: String, index: Int): String {
+        val safeVal = value.replace("\\", "\\\\").replace("'", "\\'")
+        val safeTxt = text.replace("\\", "\\\\").replace("'", "\\'")
+        val raw = evalJsSync("""
+            (function() {
+                let el = $elementId > 0 ? document.querySelector('[data-ai-id="$elementId"]') : document.querySelector('select');
+                if (!el || el.tagName.toLowerCase() !== 'select') return JSON.stringify({ status: 'error', message: 'Select element not found' });
+                let chosenIdx = $index;
+                if (chosenIdx < 0) {
+                    const q = ('$safeTxt' || '$safeVal').trim().toLowerCase();
+                    for (let i = 0; i < el.options.length; i++) {
+                        const ot = (el.options[i].text || el.options[i].value || '').trim().toLowerCase();
+                        if (ot === q || ot.includes(q)) { chosenIdx = i; break; }
+                    }
+                }
+                if (chosenIdx >= 0 && chosenIdx < el.options.length) {
+                    el.selectedIndex = chosenIdx;
+                    el.value = el.options[chosenIdx].value;
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    return JSON.stringify({ status: 'selected', selected_index: chosenIdx, selected_text: el.options[chosenIdx].text });
+                }
+                return JSON.stringify({ status: 'option_not_found' });
+            })();
+        """.trimIndent())
+        val obj = try { JSONObject(raw) } catch (_: Exception) { JSONObject().put("status", raw) }
+        return attachFreshStateAndDirective(obj, "select")
+    }
+
+    private fun performHumanTypingSync(elementId: Int, text: String, clear: Boolean, submit: Boolean, instant: Boolean): String {
+        // Check if target element is actually GitHub's filename input and contains '/'
+        if (text.contains("/") && currentUrl.contains("github.com") && (currentUrl.contains("/new/") || currentUrl.contains("/edit/"))) {
+            val isFilenameBox = evalJsSync("""
+                (function() {
+                    const el = $elementId > 0 ? document.querySelector('[data-ai-id="$elementId"]') : document.activeElement;
+                    if (!el) return 'false';
+                    const aria = (el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.name || '').toLowerCase();
+                    return (aria.includes('file name') || aria.includes('name your file') || aria.includes('filename')) ? 'true' : 'false';
+                })();
+            """.trimIndent())
+            if (isFilenameBox == "true") {
+                return performSetGitHubPathSync(text)
+            }
+        }
+
+        if (elementId > 0) {
+            performSmartClickSync(elementId, -1f, -1f)
+            Thread.sleep(120)
+        } else {
+            runOnMainSync { webView.requestFocus() }
+        }
+
+        if (clear) {
+            evalJsSync("""
+                (function() {
+                    const el = $elementId > 0 ? document.querySelector('[data-ai-id="$elementId"]') : document.activeElement;
+                    if (el && window.__aiSetReactSafeValue) window.__aiSetReactSafeValue(el, '', '', false);
+                })();
+            """.trimIndent())
+        }
+
+        if (instant) {
+            val b64 = Base64.encodeToString(text.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+            val resStr = evalJsSync("""
+                (function() {
+                    const bin = atob('$b64');
+                    const bytes = new Uint8Array(bin.length);
+                    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                    const decoded = new TextDecoder('utf-8').decode(bytes);
+                    const el = $elementId > 0 ? document.querySelector('[data-ai-id="$elementId"]') : document.activeElement;
+                    if (el && window.__aiSetReactSafeValue) {
+                        window.__aiSetReactSafeValue(el, decoded, decoded, false);
+                        const rb = (el.value !== undefined ? el.value : (el.innerText || ''));
+                        return JSON.stringify({
+                            status: 'typed_instant',
+                            expected_length: decoded.length,
+                            actual_length: rb.length,
+                            verified_input_value: rb,
+                            exact_match: rb === decoded
+                        });
+                    }
+                    return '';
+                })();
+            """.trimIndent())
+            if (resStr.startsWith("{")) {
+                return attachFreshStateAndDirective(JSONObject(resStr), "type")
+            }
+        }
+
+        for (i in 0 until text.length) {
+            if (isEmergencyStopped.get()) break
+            val ch = text[i]
+            val safe = ch.toString()
+                .replace("\\", "\\\\")
+                .replace("'", "\\'")
+                .replace("\n", "\\n")
+                .replace("\r", "")
+
+            evalJsSync("""
+                (function() {
+                    let el = $elementId > 0 ? document.querySelector('[data-ai-id="$elementId"]') : document.activeElement;
+                    if (!el || el === document.body) {
+                        el = document.querySelector('[contenteditable="true"], input:focus, textarea:focus, input:not([type="hidden"]), textarea');
+                    }
+                    if (!el) return;
+                    el.focus();
+                    el.dispatchEvent(new KeyboardEvent('keydown', { key: '$safe', bubbles: true, cancelable: true }));
+                    if (window.__aiSetReactSafeValue) {
+                        window.__aiSetReactSafeValue(el, null, '$safe', true);
+                    }
+                    el.dispatchEvent(new KeyboardEvent('keyup', { key: '$safe', bubbles: true }));
+                })();
+            """.trimIndent())
+            Thread.sleep((20..50).random().toLong())
+        }
+
+        val finalRead = evalJsSync("""
+            (function() {
+                let el = $elementId > 0 ? document.querySelector('[data-ai-id="$elementId"]') : document.activeElement;
+                if (!el) return '';
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                return (el.value !== undefined ? el.value : (el.innerText || ''));
+            })();
+        """.trimIndent())
+
+        if (submit) {
+            performSpecialKeySync("Enter")
+            evalJsSync("(function(){ const el = document.activeElement; if (el && el.form) el.form.submit(); })()")
+        }
+
+        val res = JSONObject()
+            .put("status", "typed")
+            .put("element_id", elementId)
+            .put("expected_length", text.length)
+            .put("actual_length", finalRead.length)
+            .put("verified_input_value", finalRead.take(300))
+            .put("exact_match", finalRead == text)
+            .put("submitted", submit)
+        return attachFreshStateAndDirective(res, "type")
     }
 
     private fun performSpecialKeySync(keyName: String): String {
@@ -2830,22 +2769,20 @@ class MainActivity : Activity() {
             webView.dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, keyCode))
             webView.dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_UP, keyCode))
         }
-        return JSONObject().put("status", "key_sent").put("key", keyName).toString()
+        return attachFreshStateAndDirective(JSONObject().put("status", "key_sent").put("key", keyName), "key")
     }
 
     private fun performSmoothScrollSync(dx: Float, dy: Float, elementId: Int): String {
         evalJsSync("""
             (function() {
                 let el = $elementId > 0 ? document.querySelector('[data-ai-id="$elementId"]') : null;
-                if (!el) {
-                    const modalCard = document.querySelector('#__ai_select_modal > div');
-                    el = modalCard || document.querySelector('.cm-scroller, .monaco-scrollable-element, .ace_scrollbar');
-                }
+                if (!el) el = document.querySelector('[role="dialog"] .Overlay-body, .cm-scroller, .monaco-scrollable-element');
                 if (el) el.scrollBy({ left: $dx, top: $dy, behavior: 'smooth' });
                 else window.scrollBy({ left: $dx, top: $dy, behavior: 'smooth' });
             })();
         """.trimIndent())
-        return JSONObject().put("status", "scrolled").put("dx", dx).put("dy", dy).toString()
+        Thread.sleep(250)
+        return attachFreshStateAndDirective(JSONObject().put("status", "scrolled").put("dx", dx).put("dy", dy), "scroll")
     }
 
     private fun waitForSelectorSync(selector: String, timeoutMs: Long): String {
@@ -2854,10 +2791,12 @@ class MainActivity : Activity() {
         while (System.currentTimeMillis() - start < timeoutMs) {
             if (isEmergencyStopped.get()) break
             val found = evalJsSync("(function(){ return document.querySelector('$safeSel') !== null ? 'true' : 'false'; })()")
-            if (found == "true") return JSONObject().put("status", "found").put("selector", selector).toString()
+            if (found == "true") {
+                return attachFreshStateAndDirective(JSONObject().put("status", "found").put("selector", selector), "wait")
+            }
             Thread.sleep(250)
         }
-        return JSONObject().put("status", "timeout").put("selector", selector).toString()
+        return attachFreshStateAndDirective(JSONObject().put("status", "timeout").put("selector", selector), "wait")
     }
 
     private fun captureViewportBase64Sync(): String {
@@ -2892,9 +2831,7 @@ class MainActivity : Activity() {
                 canvas.translate(-webView.scrollX.toFloat(), -webView.scrollY.toFloat())
                 webView.draw(canvas)
                 capturedBitmap = bmp
-            } catch (e: Exception) {
-                appendLog("OCR Bitmap Error: ${e.message}")
-            }
+            } catch (_: Exception) {}
         }
 
         val ocrBlocksArray = JSONArray()
@@ -2926,10 +2863,6 @@ class MainActivity : Activity() {
                                             .put("text", txt)
                                             .put("x", (left + right) / 2)
                                             .put("y", (top + bottom) / 2)
-                                            .put("left", left)
-                                            .put("top", top)
-                                            .put("right", right)
-                                            .put("bottom", bottom)
                                     )
                                     overlayBoxes.add(Pair(RectF(left.toFloat(), top.toFloat(), right.toFloat(), bottom.toFloat()), "T$id"))
                                 }
@@ -2946,16 +2879,12 @@ class MainActivity : Activity() {
             runOnMainSync { overlayView.showDomBoxes(overlayBoxes) }
         }
 
-        return JSONObject()
+        val res = JSONObject()
             .put("status", "ok")
-            .put("tab_id", activeTab?.id ?: -1)
-            .put("url", currentUrl)
-            .put("title", currentTitle)
-            .put("mode", mode)
             .put("ocr_screen_text", ocrFullText)
             .put("ocr_blocks_count", ocrBlocksArray.length())
             .put("ocr_blocks", ocrBlocksArray)
-            .toString()
+        return attachFreshStateAndDirective(res, "ocr")
     }
 
     private fun evalJsSync(script: String): String {
