@@ -1408,6 +1408,13 @@ class MainActivity : Activity() {
                     .put("elapsed_ms", System.currentTimeMillis() - startMs).put("error_code", JSONObject.NULL)
                 attachFreshStateAndDirective(res, "status")
             }
+            "/page_text", "/text", "/reader" -> extractCleanPageTextSync(body)
+            "/eval", "/userscript" -> {
+                val b64 = body?.optString("code_b64", body.optString("text_b64", "")) ?: ""
+                val code = if (b64.isNotEmpty()) String(Base64.decode(b64, Base64.DEFAULT), Charsets.UTF_8) else (body?.optString("code", body.optString("script", "")) ?: "")
+                val res = evalJsSync(code)
+                attachFreshStateAndDirective(JSONObject().put("success", true).put("status", "executed").put("result", res), "eval")
+            }
             "/goal" -> {
                 activeGoalDescription = body?.optString("goal", activeGoalDescription) ?: activeGoalDescription
                 expectedTargetFilePath = body?.optString("expected_path", expectedTargetFilePath) ?: expectedTargetFilePath
@@ -1497,6 +1504,79 @@ class MainActivity : Activity() {
             "/screenshot" -> JSONObject().put("success", true).put("url", currentUrl).put("image_base64", captureViewportBase64Sync()).toString()
             else -> JSONObject().put("success", false).put("error_code", "UNKNOWN_ENDPOINT").put("message", "Unknown: $path").toString()
         }
+    }
+
+    private fun extractCleanPageTextSync(body: JSONObject?): String {
+        val startMs = System.currentTimeMillis()
+        val offset = body?.optInt("offset", 0)?.coerceAtLeast(0) ?: 0
+        val limit = body?.optInt("limit", 0)?.coerceAtLeast(0) ?: 0
+
+        val js = """
+            (function() {
+                const errSelectors = '.flash-error, .flash-warn, [role="alert"], .js-flash-alert, .form-control.is-error, .error, .hx_flash, .Toast-item--error, .banner-error';
+                const errorNodes = document.querySelectorAll(errSelectors);
+                const errors = [];
+                errorNodes.forEach(el => {
+                    const t = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+                    if (t && !errors.includes(t)) errors.push(t);
+                });
+
+                const openDialog = document.querySelector('[role="dialog"], dialog[open], .Overlay, .Box-overlay');
+                let dialogText = '';
+                if (openDialog) {
+                    dialogText = (openDialog.innerText || '').replace(/\n{3,}/g, '\n\n').trim();
+                    if (/failed|error|conflict|cannot|protected|invalid|empty/i.test(dialogText)) {
+                        const firstLine = dialogText.split('\n')[0];
+                        if (!errors.includes(firstLine)) errors.push('[DIALOG] ' + firstLine);
+                    }
+                }
+
+                if (!document.body) {
+                    return JSON.stringify({ errors: errors, dialog_text: dialogText, full_text: '' });
+                }
+
+                const clone = document.body.cloneNode(true);
+                clone.querySelectorAll('script, style, noscript, svg, canvas, iframe').forEach(e => e.remove());
+                const cleanText = (clone.innerText || '').replace(/\n{3,}/g, '\n\n').trim();
+
+                return JSON.stringify({
+                    errors: errors,
+                    dialog_text: dialogText,
+                    full_text: cleanText
+                });
+            })();
+        """.trimIndent()
+
+        val raw = evalJsSync(js)
+        val data = try { if (raw.startsWith("{")) JSONObject(raw) else JSONObject() } catch (_: Exception) { JSONObject() }
+
+        val errorsArr = data.optJSONArray("errors") ?: JSONArray()
+        val dlgText = data.optString("dialog_text", "")
+        val fullText = data.optString("full_text", "")
+
+        val totalLen = fullText.length
+        val slicedText = if (limit > 0 && offset < totalLen) {
+            fullText.substring(offset, (offset + limit).coerceAtMost(totalLen))
+        } else {
+            fullText
+        }
+
+        val out = JSONObject()
+            .put("success", true)
+            .put("status", "ok")
+            .put("url", currentUrl)
+            .put("title", currentTitle)
+            .put("has_commit_errors", errorsArr.length() > 0)
+            .put("errors_detected", errorsArr)
+            .put("modal_dialog_text", dlgText)
+            .put("total_text_length", totalLen)
+            .put("offset", offset)
+            .put("chunk_length", slicedText.length)
+            .put("has_more", limit > 0 && (offset + limit) < totalLen)
+            .put("text", slicedText)
+            .put("elapsed_ms", System.currentTimeMillis() - startMs)
+
+        return attachFreshStateAndDirective(out, "page_text")
     }
 
     private fun performGitHubVerificationSync(body: JSONObject?): String {
