@@ -46,7 +46,7 @@ class MainActivity : Activity() {
         val webView: WebView,
         @Volatile var url: String = "https://gemini.google.com",
         @Volatile var title: String = "New Tab",
-        @Volatile var desktopMode: Boolean = false,
+        @Volatile var desktopMode: Boolean = true,
         @Volatile var isPageLoading: Boolean = false,
         @Volatile var isNetworkIdle: Boolean = true
     )
@@ -83,6 +83,10 @@ class MainActivity : Activity() {
     @Volatile private var loopStepCommitVerified = false
     @Volatile private var loopStepBuildVerified = false
     @Volatile private var lastVerifiedCommitSha = ""
+    @Volatile private var lastBackPressMs = 0L
+    @Volatile private var noExitLockActive = true
+    @Volatile private var loopStepCount = 0
+
 
 
     private val webView: WebView get() = (activeTab ?: tabs.first()).webView
@@ -127,7 +131,35 @@ class MainActivity : Activity() {
         CookieManager.getInstance().setAcceptCookie(true)
         buildUserInterface()
         createNewTab("https://gemini.google.com", switchToIt = true)
+        mainHandler.postDelayed({ updateWebViewViewportBounds() }, 150)
         ensureServerRunning()
+    }
+
+
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        if (logPanel.visibility == View.VISIBLE) {
+            logPanel.visibility = View.GONE
+            return
+        }
+        if (webView.canGoBack()) {
+            webView.goBack()
+            appendLog("◀ Navigated Back in WebView")
+            return
+        }
+        if (tabs.size > 1 && activeTab != null) {
+            val closingId = activeTab!!.id
+            closeTab(activeTab!!)
+            Toast.makeText(this, "Closed Tab #$closingId", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val now = System.currentTimeMillis()
+        if (now - lastBackPressMs < 2000L) {
+            super.onBackPressed()
+        } else {
+            lastBackPressMs = now
+            Toast.makeText(this, "Exit karne ke liye dubara Back dabayein", Toast.LENGTH_SHORT).show()
+        }
     }
 
     override fun onResume() {
@@ -215,7 +247,7 @@ class MainActivity : Activity() {
             }
         }
         val btnGo = makeSmallButton("GO") { loadFromAddressBar() }
-        desktopBtn = makeSmallButton("MOB") { applyDesktopMode(!desktopMode) }
+        desktopBtn = makeSmallButton("PC") { applyDesktopMode(!desktopMode) }.apply { setBackgroundColor(Color.parseColor("#1565C0")) }
 
         navBar.addView(btnBack); navBar.addView(btnForward); navBar.addView(btnReload)
         navBar.addView(urlInput); navBar.addView(btnGo); navBar.addView(desktopBtn)
@@ -1012,19 +1044,35 @@ class MainActivity : Activity() {
             .put("4_commit_sha_verified", loopStepCommitVerified)
             .put("5_build_verified", loopStepBuildVerified)
 
+        val stepNum = ++loopStepCount
+        val exitAllowed = isTaskComplete && !noExitLockActive
+        val selfSupervisorContract = JSONObject()
+            .put("role", "SELF_SUPERVISING_AUTONOMOUS_AGENT")
+            .put("step_counter", stepNum)
+            .put("no_exit_lock", !exitAllowed)
+            .put("exit_allowed", exitAllowed)
+            .put("rule_1_no_exit", "TUM ABHI EXIT NAHI KAR SAKTE! User ko adhura status mat do. Turant agla command execute karo.")
+            .put("rule_2_self_audit", "Har command ke baad khud Supervisor bankar check karo: Kya pichla action सच में सफल हुआ? Agar commit/build fail hua toh /raw_log ya /page_text padh kar khud fix karo.")
+            .put("rule_3_unlock_condition", "Jab 100% kaam aur build/commit verify ho jaye, tabhi POST /complete_task call karke exit unlock karo.")
+
         val directive = JSONObject()
-            .put("mode", "TINYFISH_HARD_LOOP_LOCK")
-            .put("loop_lock", if (isTaskComplete) "RELEASED_TASK_COMPLETE" else "ACTIVE_DO_NOT_STOP")
-            .put("task_complete", isTaskComplete)
+            .put("mode", "TINYFISH_NO_EXIT_SELF_SUPERVISOR")
+            .put("loop_lock", if (exitAllowed) "RELEASED_TASK_COMPLETE" else "NO_EXIT_KEEP_WORKING")
+            .put("no_exit_lock", !exitAllowed)
+            .put("exit_allowed", exitAllowed)
+            .put("task_complete", exitAllowed)
             .put("current_stage", currentStage)
             .put("dom_generation", currentGen)
             .put("checklist", checklist)
+            .put("self_supervisor_contract", selfSupervisorContract)
             .put("ai_loop_prompt", instructionMsg)
             .put("mandatory_next_action", JSONObject().put("endpoint", nextEndpoint).put("payload", nextPayload))
 
-        // Put loop control fields right at the top of the response so LLM reads them first
-        baseResponse.put("task_complete", isTaskComplete)
-        baseResponse.put("loop_lock", if (isTaskComplete) "RELEASED_TASK_COMPLETE" else "ACTIVE_DO_NOT_STOP")
+        baseResponse.put("no_exit_lock", !exitAllowed)
+        baseResponse.put("exit_allowed", exitAllowed)
+        baseResponse.put("task_complete", exitAllowed)
+        baseResponse.put("loop_lock", if (exitAllowed) "RELEASED_TASK_COMPLETE" else "NO_EXIT_KEEP_WORKING")
+        baseResponse.put("self_supervisor_contract", selfSupervisorContract)
         baseResponse.put("ai_loop_prompt", instructionMsg)
         baseResponse.put("dom_generation", currentGen)
         baseResponse.put("github_state", ghState)
@@ -1661,6 +1709,198 @@ class MainActivity : Activity() {
         }
     }
 
+
+    // ==================== DIRECT RAW LOG & COMMIT LOG FETCHER (FULL + CHUNKED) ====================
+
+    private fun performFetchRawLogSync(body: JSONObject?): String {
+        val startMs = System.currentTimeMillis()
+        val repo = resolveTargetRepo(body)
+        val mode = body?.optString("mode", "auto")?.lowercase(Locale.ROOT) ?: "auto"
+        val commitSha = body?.optString("commit_sha", body.optString("sha", activeBuildHeadSha))?.trim() ?: ""
+        val runIdParam = body?.optLong("run_id", body.optLong("build_id", 0L)) ?: 0L
+        val jobIdParam = body?.optLong("job_id", 0L) ?: 0L
+        val offset = body?.optInt("offset", 0)?.coerceAtLeast(0) ?: 0
+        val limit = body?.optInt("limit", body.optInt("chunk_size", 0))?.coerceAtLeast(0) ?: 0
+        val tailLines = body?.optInt("tail_lines", body.optInt("tail", 0))?.coerceAtLeast(0) ?: 0
+        val grepPattern = body?.optString("grep", body.optString("filter", ""))?.trim() ?: ""
+        val token = getStoredGitHubToken()
+
+        fun httpGetRawWithCookies(targetUrl: String, acceptHeader: String = "application/vnd.github+json"): String {
+            val conn = URL(targetUrl).openConnection() as HttpURLConnection
+            conn.connectTimeout = 15000
+            conn.readTimeout = 20000
+            conn.instanceFollowRedirects = true
+            conn.setRequestProperty("User-Agent", desktopUA)
+            conn.setRequestProperty("Accept", acceptHeader)
+            val cookieStr = CookieManager.getInstance().getCookie(targetUrl)
+                ?: CookieManager.getInstance().getCookie("https://github.com")
+            if (!cookieStr.isNullOrEmpty()) {
+                conn.setRequestProperty("Cookie", cookieStr)
+            }
+            if (token.isNotEmpty() && targetUrl.contains("api.github.com")) {
+                conn.setRequestProperty("Authorization", "Bearer $token")
+            }
+            val code = conn.responseCode
+            if (code in 300..399) {
+                val loc = conn.getHeaderField("Location")
+                if (!loc.isNullOrEmpty()) {
+                    val redirConn = URL(loc).openConnection() as HttpURLConnection
+                    redirConn.connectTimeout = 15000
+                    redirConn.readTimeout = 20000
+                    return redirConn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+                }
+            }
+            return (if (code in 200..299) conn.inputStream else conn.errorStream)
+                ?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: ""
+        }
+
+        var rawText = ""
+        var logSource = ""
+        var resolvedRunId = runIdParam
+        var resolvedJobId = jobIdParam
+        var resolvedSha = commitSha
+
+        try {
+            // Case 1: Current browser tab is already showing a raw log file or <pre> log page
+            if (mode == "page" || (mode == "auto" && (currentUrl.contains("/logs") || currentUrl.contains("raw.githubusercontent.com") || currentUrl.contains("actions/runs")))) {
+                val pagePre = evalJsSync("""
+                    (function() {
+                        const pre = document.querySelector('pre');
+                        if (pre && (pre.innerText || '').length > 100 && document.body.children.length <= 3) {
+                            return pre.innerText;
+                        }
+                        const logLines = document.querySelectorAll('.CheckStep-line, .js-check-step-line, [data-testid="log-line"]');
+                        if (logLines.length > 0) {
+                            const arr = [];
+                            logLines.forEach(l => arr.push((l.innerText || l.textContent || '').trim()));
+                            return arr.join('\n');
+                        }
+                        return '';
+                    })();
+                """.trimIndent())
+                if (pagePre.length > 80 && mode == "page") {
+                    rawText = pagePre
+                    logSource = "browser_open_page"
+                }
+            }
+
+            // Case 2: Fetch Git Commit Raw Patch / Diff & Commit Info
+            if (rawText.isEmpty() && (mode == "commit" || mode == "patch" || mode == "diff")) {
+                if (repo.isEmpty()) {
+                    return JSONObject().put("success", false).put("error_code", "NO_REPO").put("message", "Pass repo=owner/repo").toString()
+                }
+                val targetSha = resolvedSha.ifEmpty { "HEAD" }
+                val accept = if (mode == "patch") "application/vnd.github.v3.patch" else if (mode == "diff") "application/vnd.github.v3.diff" else "application/vnd.github+json"
+                rawText = httpGetRawWithCookies("https://api.github.com/repos/$repo/commits/$targetSha", accept)
+                logSource = "github_commit_$mode"
+            }
+
+            // Case 3: Fetch GitHub Actions Job Raw Log (by job_id, run_id, or latest run for commit_sha/repo)
+            if (rawText.isEmpty() && repo.isNotEmpty()) {
+                if (resolvedJobId <= 0L) {
+                    if (resolvedRunId <= 0L) {
+                        val runsJson = JSONObject(httpGetRawWithCookies("https://api.github.com/repos/$repo/actions/runs?per_page=10"))
+                        val runsArr = runsJson.optJSONArray("workflow_runs") ?: JSONArray()
+                        for (i in 0 until runsArr.length()) {
+                            val r = runsArr.getJSONObject(i)
+                            if (resolvedSha.isEmpty() || r.optString("head_sha", "").startsWith(resolvedSha, ignoreCase = true)) {
+                                resolvedRunId = r.optLong("id", 0L)
+                                resolvedSha = r.optString("head_sha", "")
+                                break
+                            }
+                        }
+                        if (resolvedRunId <= 0L && runsArr.length() > 0) {
+                            val r0 = runsArr.getJSONObject(0)
+                            resolvedRunId = r0.optLong("id", 0L)
+                            resolvedSha = r0.optString("head_sha", "")
+                        }
+                    }
+
+                    if (resolvedRunId > 0L) {
+                        val jobsJson = JSONObject(httpGetRawWithCookies("https://api.github.com/repos/$repo/actions/runs/$resolvedRunId/jobs"))
+                        val jobsArr = jobsJson.optJSONArray("jobs") ?: JSONArray()
+                        // Prefer failed job if any, otherwise latest job
+                        for (j in 0 until jobsArr.length()) {
+                            val jb = jobsArr.getJSONObject(j)
+                            if (jb.optString("conclusion") == "failure") {
+                                resolvedJobId = jb.optLong("id", 0L)
+                                break
+                            }
+                        }
+                        if (resolvedJobId <= 0L && jobsArr.length() > 0) {
+                            resolvedJobId = jobsArr.getJSONObject(0).optLong("id", 0L)
+                        }
+                    }
+                }
+
+                if (resolvedJobId > 0L) {
+                    rawText = httpGetRawWithCookies("https://api.github.com/repos/$repo/actions/jobs/$resolvedJobId/logs", "*/*")
+                    logSource = "github_actions_job_raw_log"
+
+                    // If API required extra redirect or returned short message, also assemble step logs if needed
+                    if (rawText.length < 40 && resolvedRunId > 0L) {
+                        rawText = httpGetRawWithCookies("https://github.com/$repo/commit/$resolvedSha/checks", "text/html")
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            return JSONObject()
+                .put("success", false)
+                .put("error_code", "RAW_LOG_FETCH_ERROR")
+                .put("message", e.message ?: "Failed to fetch raw log")
+                .toString()
+        }
+
+        // Apply optional grep filter or tail_lines filter
+        var processedText = rawText.replace("\r\n", "\n")
+        val allLines = if (processedText.isEmpty()) emptyList() else processedText.split("\n")
+        val totalLinesCount = allLines.size
+
+        if (grepPattern.isNotEmpty()) {
+            val rx = try { Regex(grepPattern, RegexOption.IGNORE_CASE) } catch (_: Exception) { null }
+            val matchedLines = mutableListOf<String>()
+            for (i in allLines.indices) {
+                val ln = allLines[i]
+                val hit = rx?.containsMatchIn(ln) ?: ln.contains(grepPattern, ignoreCase = true)
+                if (hit) matchedLines.add("L${i + 1}: $ln")
+            }
+            processedText = matchedLines.joinToString("\n")
+        } else if (tailLines > 0 && allLines.size > tailLines) {
+            processedText = allLines.takeLast(tailLines).joinToString("\n")
+        }
+
+        val totalChars = processedText.length
+        val sliced = if (limit > 0 && offset < totalChars) {
+            processedText.substring(offset, (offset + limit).coerceAtMost(totalChars))
+        } else if (offset >= totalChars && totalChars > 0) {
+            ""
+        } else {
+            processedText
+        }
+
+        val hasMore = limit > 0 && (offset + limit) < totalChars
+        val nextOffset = if (hasMore) offset + limit else totalChars
+
+        val out = JSONObject()
+            .put("success", rawText.isNotEmpty())
+            .put("status", if (rawText.isNotEmpty()) "ok" else "empty_log")
+            .put("repo", repo)
+            .put("source", logSource)
+            .put("commit_sha", resolvedSha)
+            .put("run_id", resolvedRunId)
+            .put("job_id", resolvedJobId)
+            .put("total_lines", totalLinesCount)
+            .put("total_length", totalChars)
+            .put("offset", offset)
+            .put("chunk_length", sliced.length)
+            .put("has_more", hasMore)
+            .put("next_offset", nextOffset)
+            .put("raw_log", sliced)
+            .put("elapsed_ms", System.currentTimeMillis() - startMs)
+
+        return attachFreshStateAndDirective(out, "raw_log")
+    }
+
     private fun executeCommand(method: String, path: String, body: JSONObject?): String {
         val startMs = System.currentTimeMillis()
         isEmergencyStopped.set(false)
@@ -1682,6 +1922,24 @@ class MainActivity : Activity() {
                 attachFreshStateAndDirective(res, "status")
             }
             "/page_text", "/text", "/reader" -> extractCleanPageTextSync(body)
+            "/raw_log", "/commit_log", "/build/logs", "/job_log" -> performFetchRawLogSync(body)
+            "/complete_task", "/unlock_exit" -> {
+                val reason = body?.optString("summary", body.optString("reason", "")) ?: ""
+                val canExit = loopStepCommitVerified || body?.optBoolean("force_unlock", false) == true
+                if (canExit) {
+                    noExitLockActive = false
+                    loopStepBuildVerified = true
+                }
+                attachFreshStateAndDirective(
+                    JSONObject()
+                        .put("success", canExit)
+                        .put("exit_unlocked", canExit)
+                        .put("summary", reason)
+                        .put("message", if (canExit) "Task verified complete. AI may now report final summary." else "EXIT REJECTED: Task steps are not yet verified! Continue working."),
+                    "complete_task"
+                )
+            }
+
             "/pipeline", "/auto_pipeline" -> performAtomicPipelineSync(body)
             "/reset_loop" -> {
                 loopStepReadDone = false; loopStepEditVerified = false; loopStepDiffVerified = false
