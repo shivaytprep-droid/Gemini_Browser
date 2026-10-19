@@ -71,7 +71,7 @@ class MainActivity : Activity() {
     @Volatile private var expectedTargetContentLength: Int = 0
     @Volatile private var expectedTargetContentSha256: String = ""
 
-    @Volatile private var activeBuildRepo: String = "shivaytprep-droid/Gemini_Browser"
+    @Volatile private var activeBuildRepo: String = ""
     @Volatile private var activeBuildRunId: Long = 0L
     @Volatile private var activeBuildHeadSha: String = ""
     @Volatile private var activeBuildToken: String = ""
@@ -1083,16 +1083,70 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun extractRepoFromUrl(url: String): String {
+        val m = Regex("github\.com/([^/?#]+)/([^/?#]+)").find(url) ?: return ""
+        val owner = m.groupValues[1].trim()
+        val repoName = m.groupValues[2].removeSuffix(".git").trim()
+        val reserved = setOf(
+            "settings", "notifications", "orgs", "organizations", "users",
+            "login", "session", "marketplace", "explore", "topics",
+            "collections", "events", "sponsors", "new", "codespaces",
+            "pulls", "issues", "search", "features", "pricing", "about"
+        )
+        if (owner.lowercase(Locale.ROOT) in reserved || repoName.isEmpty()) return ""
+        return "$owner/$repoName"
+    }
+
+    private fun resolveTargetRepo(body: JSONObject? = null): String {
+        val fromBody = body?.optString("repo", "")?.trim() ?: ""
+        if (fromBody.isNotEmpty() && fromBody.contains("/")) {
+            if (fromBody != activeBuildRepo) {
+                activeBuildRepo = fromBody
+                activeBuildHeadSha = ""
+                activeBuildRunId = 0L
+            }
+            return fromBody
+        }
+
+        val fromCurrent = extractRepoFromUrl(currentUrl)
+        if (fromCurrent.isNotEmpty()) {
+            if (fromCurrent != activeBuildRepo) {
+                activeBuildRepo = fromCurrent
+                activeBuildHeadSha = ""
+                activeBuildRunId = 0L
+            }
+            return fromCurrent
+        }
+
+        for (i in tabs.size - 1 downTo 0) {
+            val fromTab = extractRepoFromUrl(tabs[i].url)
+            if (fromTab.isNotEmpty()) {
+                if (fromTab != activeBuildRepo) {
+                    activeBuildRepo = fromTab
+                    activeBuildHeadSha = ""
+                    activeBuildRunId = 0L
+                }
+                return fromTab
+            }
+        }
+
+        return activeBuildRepo
+    }
+
     private fun parseGitHubUrlMeta(url: String): JSONObject {
         val meta = JSONObject()
-        val m = Regex("github\\.com/([^/]+/[^/?#]+)(?:/(blob|edit|new|raw|tree)/([^/?#]+)(?:/(.*))?)?").find(url)
+        val detectedRepo = extractRepoFromUrl(url).ifEmpty { resolveTargetRepo(null) }
+        val m = Regex("github\.com/[^/?#]+/[^/?#]+(?:/(blob|edit|new|raw|tree)/([^/?#]+)(?:/(.*))?)?").find(url)
         if (m != null) {
-            meta.put("repo", m.groupValues[1].removeSuffix(".git"))
-            meta.put("mode", m.groupValues[2].ifEmpty { "repo" })
-            meta.put("branch", m.groupValues[3].ifEmpty { "main" })
-            meta.put("url_path", URLDecoder.decode(m.groupValues[4].substringBefore("?"), "UTF-8"))
+            meta.put("repo", detectedRepo)
+            meta.put("mode", m.groupValues[1].ifEmpty { "repo" })
+            meta.put("branch", m.groupValues[2].ifEmpty { "main" })
+            meta.put("url_path", URLDecoder.decode(m.groupValues[3].substringBefore("?"), "UTF-8"))
         } else {
-            meta.put("repo", activeBuildRepo); meta.put("mode", "unknown"); meta.put("branch", "main"); meta.put("url_path", "")
+            meta.put("repo", detectedRepo)
+            meta.put("mode", "unknown")
+            meta.put("branch", "main")
+            meta.put("url_path", "")
         }
         return meta
     }
@@ -1376,10 +1430,11 @@ class MainActivity : Activity() {
 
     private fun performGitHubFileApiSync(method: String, body: JSONObject?): String {
         val urlMeta = parseGitHubUrlMeta(currentUrl)
-        val repo = body?.optString("repo", "")?.ifEmpty { urlMeta.optString("repo", activeBuildRepo) } ?: activeBuildRepo
+        val repo = resolveTargetRepo(body)
         val branch = body?.optString("branch", "")?.ifEmpty { urlMeta.optString("branch", "main") } ?: "main"
         val path = (body?.optString("path", body.optString("file_path", ""))?.ifEmpty { urlMeta.optString("url_path", "") } ?: "").removePrefix("/")
         val token = getStoredGitHubToken()
+        if (repo.isEmpty()) return JSONObject().put("success", false).put("error_code", "NO_REPO_DETECTED").put("message", "Open a GitHub repo tab or pass ?repo=owner/repo").toString()
         if (path.isEmpty()) return JSONObject().put("success", false).put("error_code", "MISSING_PATH").toString()
 
         return try {
@@ -1391,19 +1446,20 @@ class MainActivity : Activity() {
             originalFileSnapshots[path] = decoded
             JSONObject().put("success", true).put("repo", repo).put("branch", branch).put("file_path", path).put("blob_sha", obj.optString("sha", "")).put("editor_length", decoded.length).put("content_hash", sha256Hex(decoded)).put("content", decoded).toString()
         } catch (e: Exception) {
-            JSONObject().put("success", false).put("error_code", "GITHUB_READ_ERR").put("message", e.message).toString()
+            JSONObject().put("success", false).put("repo", repo).put("error_code", "GITHUB_READ_ERR").put("message", e.message).toString()
         }
     }
 
     private fun performGitHubDirectCommitSync(body: JSONObject?): String {
         val urlMeta = parseGitHubUrlMeta(currentUrl)
         val ghState = inspectGitHubPageStateSync()
-        val repo = body?.optString("repo", "")?.ifEmpty { urlMeta.optString("repo", activeBuildRepo) } ?: activeBuildRepo
+        val repo = resolveTargetRepo(body)
         val branch = body?.optString("branch", "")?.ifEmpty { urlMeta.optString("branch", "main") } ?: "main"
         val path = (body?.optString("path", body.optString("file_path", ""))?.ifEmpty { ghState.optString("effective_full_path", "").ifEmpty { urlMeta.optString("url_path", "") } } ?: "").removePrefix("/")
         val msg = body?.optString("message", "Update $path") ?: "Update $path"
         if (body != null && body.has("token")) saveStoredGitHubToken(body.optString("token", ""))
         val token = getStoredGitHubToken()
+        if (repo.isEmpty()) return JSONObject().put("success", false).put("error_code", "NO_REPO_DETECTED").put("message", "Open a GitHub repo tab or pass repo in JSON").toString()
         if (token.isEmpty()) return JSONObject().put("success", false).put("error_code", "MISSING_TOKEN").put("message", "POST /github/token first").toString()
 
         val b64In = body?.optString("text_b64", "") ?: ""
@@ -1431,16 +1487,22 @@ class MainActivity : Activity() {
             pc.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
             val resp = JSONObject((if (pc.responseCode in 200..299) pc.inputStream else pc.errorStream)!!.bufferedReader().use { it.readText() })
             val newSha = resp.optJSONObject("commit")?.optString("sha", "") ?: ""
-            activeBuildHeadSha = newSha; originalFileSnapshots[path] = content
+            activeBuildRepo = repo
+            activeBuildHeadSha = newSha
+            originalFileSnapshots[path] = content
             JSONObject().put("success", newSha.isNotEmpty()).put("status", "committed_via_github_api").put("repo", repo).put("branch", branch).put("file_path", path).put("commit_sha", newSha).put("content_hash", sha256Hex(content)).put("editor_length", content.length).toString()
         } catch (e: Exception) {
-            JSONObject().put("success", false).put("error_code", "COMMIT_ERR").put("message", e.message).toString()
+            JSONObject().put("success", false).put("repo", repo).put("error_code", "COMMIT_ERR").put("message", e.message).toString()
         }
     }
 
     private fun performTriggerOrBindBuildSync(body: JSONObject?): String {
-        val repo = body?.optString("repo", "")?.ifEmpty { activeBuildRepo } ?: activeBuildRepo
-        val branch = body?.optString("branch", "main") ?: "main"
+        val repo = resolveTargetRepo(body)
+        if (repo.isEmpty()) {
+            return JSONObject().put("success", false).put("error_code", "NO_REPO_DETECTED").put("message", "Open a GitHub repo in browser or pass {"repo": "owner/repo"}").toString()
+        }
+        val urlMeta = parseGitHubUrlMeta(currentUrl)
+        val branch = body?.optString("branch", "")?.ifEmpty { urlMeta.optString("branch", "main") } ?: "main"
         val workflow = body?.optString("workflow", "") ?: ""
         val token = getStoredGitHubToken()
         if (body?.has("commit_sha") == true) activeBuildHeadSha = body.optString("commit_sha", "")
@@ -1462,30 +1524,63 @@ class MainActivity : Activity() {
     }
 
     private fun performGetBuildStatusSync(body: JSONObject?): String {
-        val repo = body?.optString("repo", "")?.ifEmpty { activeBuildRepo } ?: activeBuildRepo
-        val filterSha = body?.optString("commit_sha", "")?.ifEmpty { activeBuildHeadSha } ?: activeBuildHeadSha
+        val repo = resolveTargetRepo(body)
+        if (repo.isEmpty()) {
+            return JSONObject()
+                .put("success", false)
+                .put("status", "error")
+                .put("error_code", "NO_REPO_DETECTED")
+                .put("message", "No GitHub repository detected in active tabs. Open a GitHub repo tab or pass ?repo=owner/repo")
+                .toString()
+        }
+
+        val explicitSha = body?.optString("commit_sha", "")?.trim() ?: ""
+        val requestedRunId = body?.optLong("build_id", body.optLong("run_id", 0L)) ?: 0L
         val downloadApk = body?.optBoolean("download_apk", false) ?: false
         val token = getStoredGitHubToken()
 
         fun apiGet(u: String): String {
             val c = URL(u).openConnection() as HttpURLConnection
+            c.connectTimeout = 12000; c.readTimeout = 12000
             c.instanceFollowRedirects = true; c.setRequestProperty("User-Agent", "Gemini-Browser")
+            c.setRequestProperty("Accept", "application/vnd.github+json")
             if (token.isNotEmpty()) c.setRequestProperty("Authorization", "Bearer $token")
             return c.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
         }
 
         return try {
-            val runs = JSONObject(apiGet("https://api.github.com/repos/$repo/actions/runs?per_page=8")).optJSONArray("workflow_runs") ?: JSONArray()
+            val runs = JSONObject(apiGet("https://api.github.com/repos/$repo/actions/runs?per_page=10")).optJSONArray("workflow_runs") ?: JSONArray()
             var run: JSONObject? = null
-            for (i in 0 until runs.length()) {
-                val r = runs.getJSONObject(i)
-                if (filterSha.isNotEmpty() && r.optString("head_sha", "").startsWith(filterSha)) { run = r; break }
+
+            // 1. Match by explicit build_id / run_id if provided
+            if (requestedRunId > 0L) {
+                for (i in 0 until runs.length()) {
+                    val r = runs.getJSONObject(i)
+                    if (r.optLong("id", 0L) == requestedRunId) { run = r; break }
+                }
             }
-            if (run == null && runs.length() > 0) run = runs.getJSONObject(0)
-            if (run == null) return JSONObject().put("status", "no_runs").toString()
+            // 2. Match by explicit commit_sha if provided
+            if (run == null && explicitSha.isNotEmpty()) {
+                for (i in 0 until runs.length()) {
+                    val r = runs.getJSONObject(i)
+                    if (r.optString("head_sha", "").startsWith(explicitSha, ignoreCase = true)) { run = r; break }
+                }
+            }
+            // 3. Otherwise always take the latest workflow run of the target repo!
+            if (run == null && runs.length() > 0) {
+                run = runs.getJSONObject(0)
+            }
+            if (run == null) {
+                return JSONObject().put("success", false).put("status", "no_workflow_runs_found").put("repo", repo).toString()
+            }
 
             val runId = run.optLong("id", 0L)
+            val headSha = run.optString("head_sha", "")
+            val runStatus = run.optString("status", "")
             val conclusion = run.optString("conclusion", "")
+            activeBuildRunId = runId
+            activeBuildHeadSha = headSha
+
             val stepsArr = JSONArray(); val failedArr = JSONArray(); val errLogs = JSONArray()
 
             val jobs = JSONObject(apiGet("https://api.github.com/repos/$repo/actions/runs/$runId/jobs")).optJSONArray("jobs") ?: JSONArray()
@@ -1500,12 +1595,29 @@ class MainActivity : Activity() {
                 if (job.optString("conclusion") == "failure") {
                     try {
                         val rawLog = apiGet("https://api.github.com/repos/$repo/actions/jobs/${job.optLong("id")}/logs")
-                        rawLog.lines().filter { l -> listOf("error:", "exception", "failed", "unresolved").any { l.lowercase().contains(it) } }.takeLast(30).forEach { errLogs.put(it.trim()) }
+                        rawLog.lines().filter { l -> listOf("error:", "exception", "failed", "unresolved", "what went wrong").any { l.lowercase().contains(it) } }.takeLast(35).forEach { errLogs.put(it.trim()) }
                     } catch (_: Exception) {}
                 }
             }
 
             val apkObj = JSONObject().put("available", false)
+
+            // A. Check Workflow Run Artifacts for this specific runId
+            try {
+                val artJson = JSONObject(apiGet("https://api.github.com/repos/$repo/actions/runs/$runId/artifacts"))
+                val arts = artJson.optJSONArray("artifacts") ?: JSONArray()
+                if (arts.length() > 0) {
+                    val a0 = arts.getJSONObject(0)
+                    apkObj.put("available", true)
+                    apkObj.put("source", "workflow_run_artifact")
+                    apkObj.put("artifact_id", a0.optLong("id", 0L))
+                    apkObj.put("apk_name", a0.optString("name", "artifact.zip"))
+                    apkObj.put("apk_size", a0.optLong("size_in_bytes", 0L))
+                    apkObj.put("download_url", a0.optString("archive_download_url", ""))
+                }
+            } catch (_: Exception) {}
+
+            // B. Check GitHub Releases (latest) for direct .apk or binary asset
             try {
                 val rel = JSONObject(apiGet("https://api.github.com/repos/$repo/releases/latest"))
                 val assets = rel.optJSONArray("assets") ?: JSONArray()
@@ -1514,7 +1626,12 @@ class MainActivity : Activity() {
                     val dlUrl = a0.optString("browser_download_url", "")
                     val apkName = a0.optString("name", "app.apk")
                     val apkSize = a0.optLong("size", 0L)
-                    apkObj.put("available", true).put("apk_name", apkName).put("apk_size", apkSize).put("download_url", dlUrl)
+                    apkObj.put("available", true)
+                    apkObj.put("source", "github_release_latest")
+                    apkObj.put("release_tag", rel.optString("tag_name", ""))
+                    apkObj.put("apk_name", apkName)
+                    apkObj.put("apk_size", apkSize)
+                    apkObj.put("download_url", dlUrl)
                     if (downloadApk && conclusion == "success" && dlUrl.isNotEmpty()) {
                         val dest = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), apkName)
                         URL(dlUrl).openStream().use { inp -> FileOutputStream(dest).use { inp.copyTo(it) } }
@@ -1523,9 +1640,24 @@ class MainActivity : Activity() {
                 }
             } catch (_: Exception) {}
 
-            JSONObject().put("success", true).put("status", "ok").put("repo", repo).put("build_id", runId).put("head_sha", run.optString("head_sha")).put("run_status", run.optString("status")).put("conclusion", conclusion).put("steps", stepsArr).put("failed_steps", failedArr).put("error_logs", errLogs).put("apk_artifact", apkObj).toString()
+            JSONObject()
+                .put("success", true)
+                .put("status", "ok")
+                .put("repo", repo)
+                .put("workflow_name", run.optString("name", ""))
+                .put("build_id", runId)
+                .put("head_sha", headSha)
+                .put("head_branch", run.optString("head_branch", ""))
+                .put("run_status", runStatus)
+                .put("conclusion", conclusion)
+                .put("html_url", run.optString("html_url", ""))
+                .put("steps", stepsArr)
+                .put("failed_steps", failedArr)
+                .put("error_logs", errLogs)
+                .put("apk_artifact", apkObj)
+                .toString()
         } catch (e: Exception) {
-            JSONObject().put("success", false).put("status", "api_error").put("message", e.message).toString()
+            JSONObject().put("success", false).put("repo", repo).put("status", "api_error").put("message", e.message).toString()
         }
     }
 
