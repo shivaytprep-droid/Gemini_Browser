@@ -1084,7 +1084,7 @@ class MainActivity : Activity() {
     }
 
     private fun extractRepoFromUrl(url: String): String {
-        val m = Regex("github\.com/([^/?#]+)/([^/?#]+)").find(url) ?: return ""
+        val m = Regex("github\\.com/([^/?#]+)/([^/?#]+)").find(url) ?: return ""
         val owner = m.groupValues[1].trim()
         val repoName = m.groupValues[2].removeSuffix(".git").trim()
         val reserved = setOf(
@@ -1136,7 +1136,7 @@ class MainActivity : Activity() {
     private fun parseGitHubUrlMeta(url: String): JSONObject {
         val meta = JSONObject()
         val detectedRepo = extractRepoFromUrl(url).ifEmpty { resolveTargetRepo(null) }
-        val m = Regex("github\.com/[^/?#]+/[^/?#]+(?:/(blob|edit|new|raw|tree)/([^/?#]+)(?:/(.*))?)?").find(url)
+        val m = Regex("github\\.com/[^/?#]+/[^/?#]+(?:/(blob|edit|new|raw|tree)/([^/?#]+)(?:/(.*))?)?").find(url)
         if (m != null) {
             meta.put("repo", detectedRepo)
             meta.put("mode", m.groupValues[1].ifEmpty { "repo" })
@@ -1499,7 +1499,7 @@ class MainActivity : Activity() {
     private fun performTriggerOrBindBuildSync(body: JSONObject?): String {
         val repo = resolveTargetRepo(body)
         if (repo.isEmpty()) {
-            return JSONObject().put("success", false).put("error_code", "NO_REPO_DETECTED").put("message", "Open a GitHub repo in browser or pass {"repo": "owner/repo"}").toString()
+            return JSONObject().put("success", false).put("error_code", "NO_REPO_DETECTED").put("message", "Open a GitHub repo in browser or pass repo=owner/repo").toString()
         }
         val urlMeta = parseGitHubUrlMeta(currentUrl)
         val branch = body?.optString("branch", "")?.ifEmpty { urlMeta.optString("branch", "main") } ?: "main"
