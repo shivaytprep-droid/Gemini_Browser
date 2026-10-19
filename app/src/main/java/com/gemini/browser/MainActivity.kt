@@ -699,9 +699,35 @@ class MainActivity : Activity() {
 
     // ==================== IMPROVEMENT 3B: DEDICATED GITHUB PATH SETTER ====================
 
-    private fun performSetGitHubPathSync(targetPath: String): String {
+    private fun performSetGitHubPathSync(targetPath: String, allowRenameOnEdit: Boolean = false): String {
         val cleanPath = targetPath.trim().removePrefix("/")
         expectedTargetFilePath = cleanPath
+
+        val initialGhState = inspectGitHubPageStateSync()
+        val currentEffPath = initialGhState.optString("effective_full_path", "")
+        if (currentEffPath.equals(cleanPath, ignoreCase = true)) {
+            return attachFreshStateAndDirective(
+                JSONObject()
+                    .put("success", true)
+                    .put("status", "path_already_verified")
+                    .put("expected_path", cleanPath)
+                    .put("effective_full_path", currentEffPath)
+                    .put("verified", true),
+                "set_github_path"
+            )
+        }
+        if (currentUrl.contains("/edit/") && !allowRenameOnEdit && currentEffPath.isNotEmpty()) {
+            return attachFreshStateAndDirective(
+                JSONObject()
+                    .put("success", false)
+                    .put("status", "path_change_blocked_on_edit_page")
+                    .put("error_code", "EDIT_PAGE_PATH_PROTECTED")
+                    .put("message", "Refusing to overwrite existing file path on /edit/ page without allow_rename=true")
+                    .put("current_file_path", currentEffPath)
+                    .put("requested_path", cleanPath),
+                "set_github_path"
+            )
+        }
 
         // 1. Focus the filename input and clear any existing breadcrumb segments with Backspace if needed
         val prepJs = """
@@ -1907,6 +1933,22 @@ class MainActivity : Activity() {
                 )
             }
 
+                        "/diff", "/git_diff" -> performGetDiffSync(body)
+
+            "/github/token", "/config/token" -> {
+                val tok = body?.optString("token", "") ?: ""
+                saveStoredGitHubToken(tok)
+                JSONObject()
+                    .put("success", getStoredGitHubToken().isNotEmpty())
+                    .put("status", "ok")
+                    .put("github_token_configured", getStoredGitHubToken().isNotEmpty())
+                    .toString()
+            }
+
+            "/github/file" -> performGitHubFileApiSync(method, body)
+
+            "/github/commit", "/commit" -> performGitHubDirectCommitSync(body)
+
             "/github_state" -> {
                 attachFreshStateAndDirective(JSONObject().put("status", "ok"), "github_state")
             }
@@ -2010,7 +2052,17 @@ class MainActivity : Activity() {
                 performHumanTypingSync(elId, text, clear, submit, instant)
             }
 
-            "/editor" -> performCodeEditorActionSync(body ?: JSONObject())
+            "/editor" -> {
+                val edBody = body ?: JSONObject()
+                if (!edBody.has("action")) {
+                    when (method) {
+                        "GET" -> edBody.put("action", "get_code")
+                        "PUT" -> edBody.put("action", "set_code")
+                        else -> if (edBody.has("text") || edBody.has("text_b64")) edBody.put("action", "set_code") else edBody.put("action", "get_code")
+                    }
+                }
+                performCodeEditorActionSync(edBody)
+            }
 
             "/key" -> {
                 val keyName = body?.optString("key", "Enter") ?: "Enter"
@@ -2407,6 +2459,8 @@ class MainActivity : Activity() {
                 function readCurrentCode() {
                     if (monacoModels.length > 0) return (monacoModels[0].getValue() || '').replace(/\r\n/g, '\n');
                     if (cmView) return (cmView.state.doc.toString() || '').replace(/\r\n/g, '\n');
+                    const roTa = document.querySelector('textarea[data-testid="read-only-cursor-text-area"], textarea.file-editor-textarea');
+                    if (roTa && roTa.value) return roTa.value.replace(/\r\n/g, '\n');
                     if (cmContent) {
                         const lines = cmContent.querySelectorAll('.cm-line');
                         if (lines.length > 0) {
@@ -2597,16 +2651,60 @@ class MainActivity : Activity() {
             })();
         """.trimIndent()
 
+        val startMs = System.currentTimeMillis()
         val rawRes = evalJsSync(js)
         val resObj = try { if (rawRes.startsWith("{")) JSONObject(rawRes) else JSONObject().put("status", "error") } catch (_: Exception) { JSONObject() }
-        if (resObj.has("readback_full")) {
+
+        val ghState = inspectGitHubPageStateSync()
+        val urlMeta = parseGitHubUrlMeta(currentUrl)
+        val effPath = ghState.optString("effective_full_path", "").ifEmpty { urlMeta.optString("url_path", "") }
+        val branch = urlMeta.optString("branch", "main")
+        val repo = urlMeta.optString("repo", activeBuildRepo)
+
+        resObj.put("repo", repo)
+        resObj.put("branch", branch)
+        resObj.put("filename", effPath.substringAfterLast("/"))
+        resObj.put("file_path", effPath)
+
+        if (action == "get_code" || action == "copy") {
+            var codeContent = resObj.optString("content", "")
+            // If DOM editor was virtualized or empty on an existing file, fallback to GitHub API read
+            if (codeContent.isEmpty() && effPath.isNotEmpty() && repo.contains("/")) {
+                try {
+                    val apiRes = JSONObject(performGitHubFileApiSync("GET", JSONObject().put("repo", repo).put("path", effPath).put("branch", branch)))
+                    if (apiRes.optBoolean("success", false)) {
+                        codeContent = apiRes.optString("content", "")
+                        resObj.put("content", codeContent)
+                        resObj.put("actual_length", codeContent.length)
+                        resObj.put("engine", "github_api_fallback")
+                    }
+                } catch (_: Exception) {}
+            }
+            val cHash = sha256Hex(codeContent)
+            if (!body.optBoolean("_internal_no_snapshot", false) && effPath.isNotEmpty() && !originalFileSnapshots.containsKey(effPath)) {
+                originalFileSnapshots[effPath] = codeContent
+            }
+            resObj.put("success", true)
+            resObj.put("editor_length", codeContent.length)
+            resObj.put("content_hash", cHash)
+        } else if (resObj.has("readback_full")) {
             val rbFull = resObj.optString("readback_full", "")
-            resObj.put("sha256_expected", sha256Hex(text))
-            resObj.put("sha256_actual", sha256Hex(rbFull))
-            // Keep response compact if content is huge, but keep full readback up to 4000 chars
+            val expHash = sha256Hex(text)
+            val actHash = sha256Hex(rbFull)
+            val isVerified = resObj.optBoolean("verified", false)
+            resObj.put("success", isVerified)
+            resObj.put("editor_length", rbFull.length)
+            resObj.put("content_hash", actHash)
+            resObj.put("sha256_expected", expHash)
+            resObj.put("sha256_actual", actHash)
             if (rbFull.length > 4000) {
                 resObj.put("readback_full", rbFull.take(4000) + "...[truncated]")
             }
+        }
+        resObj.put("elapsed_ms", System.currentTimeMillis() - startMs)
+        resObj.put("error_code", if (resObj.optBoolean("success", true)) JSONObject.NULL else "EDITOR_MISMATCH")
+        if (body.optBoolean("_internal_no_snapshot", false)) {
+            return resObj.toString()
         }
         return attachFreshStateAndDirective(resObj, "editor_$action")
     }
