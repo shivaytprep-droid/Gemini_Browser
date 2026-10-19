@@ -77,6 +77,13 @@ class MainActivity : Activity() {
     @Volatile private var activeBuildToken: String = ""
     private val originalFileSnapshots = ConcurrentHashMap<String, String>()
     private val chunkBuffer = StringBuilder()
+    @Volatile private var loopStepReadDone = false
+    @Volatile private var loopStepEditVerified = false
+    @Volatile private var loopStepDiffVerified = false
+    @Volatile private var loopStepCommitVerified = false
+    @Volatile private var loopStepBuildVerified = false
+    @Volatile private var lastVerifiedCommitSha = ""
+
 
     private val webView: WebView get() = (activeTab ?: tabs.first()).webView
     private val desktopMode: Boolean get() = activeTab?.desktopMode ?: false
@@ -908,6 +915,88 @@ class MainActivity : Activity() {
         val domArr = try { if (domStr.startsWith("[")) JSONArray(domStr) else JSONArray() } catch (_: Exception) { JSONArray() }
         val ghState = inspectGitHubPageStateSync()
         val hasDialog = ghState.optBoolean("has_open_dialog", false)
+        val isEditor = ghState.optBoolean("is_in_editor", false)
+        val effPath = ghState.optString("effective_full_path", "")
+        val edLen = ghState.optInt("editor_length", 0)
+        val pageCommitId = ghState.optInt("page_commit_button_id", -1)
+        val dlgCommitId = ghState.optInt("dialog_commit_button_id", -1)
+        val repo = ghState.optString("repo", activeBuildRepo)
+
+        // Update state machine flags based on action & verified results
+        if (actionName.startsWith("editor_get") || actionName == "navigate" || actionName == "github_state") {
+            if (isEditor || effPath.isNotEmpty()) loopStepReadDone = true
+        }
+        if (actionName == "editor_set_code" && baseResponse.optBoolean("verified", false)) {
+            loopStepReadDone = true
+            loopStepEditVerified = true
+            loopStepDiffVerified = false
+            loopStepCommitVerified = false
+            loopStepBuildVerified = false
+        }
+        if (actionName == "diff" && baseResponse.optBoolean("safe_to_commit", false)) {
+            loopStepDiffVerified = true
+        }
+        if ((actionName == "github_commit" && baseResponse.optBoolean("success", false)) ||
+            (actionName == "verify" && baseResponse.optBoolean("commit_verified", false))) {
+            loopStepCommitVerified = true
+            lastVerifiedCommitSha = baseResponse.optString("commit_sha", ghState.optString("commit_sha", ""))
+        }
+        if (actionName == "build_status" && baseResponse.optString("run_status") == "completed" && baseResponse.optString("conclusion") == "success") {
+            loopStepBuildVerified = true
+        }
+
+        // Determine current Stage & Mandatory Next Action to lock AI in continuous execution loop
+        val currentStage: String
+        val nextEndpoint: String
+        val nextPayload = JSONObject()
+        val instructionMsg: String
+        var isTaskComplete = false
+
+        if (isEditor && !loopStepEditVerified) {
+            currentStage = "STAGE_2_WRITE_AND_VERIFY_CODE"
+            nextEndpoint = "PUT /editor"
+            nextPayload.put("action", "set_code").put("text_b64", "<BASE64_FULL_CODE>")
+            instructionMsg = "🚨 [LOOP LOCK ACTIVE - STEP 2/6]: Editor is open for '$effPath' (current length:$edLen). DO NOT STOP or reply to user! Send full code via PUT /editor and verify exact_match==true."
+        } else if (loopStepEditVerified && !loopStepDiffVerified) {
+            currentStage = "STAGE_3_VERIFY_GIT_DIFF"
+            nextEndpoint = "GET /diff"
+            instructionMsg = "🚨 [LOOP LOCK ACTIVE - STEP 3/6]: Code written & hash matched ($edLen chars). DO NOT STOP! Immediately call GET /diff to verify unified_diff and file identity before committing."
+        } else if (loopStepDiffVerified && !loopStepCommitVerified) {
+            if (getStoredGitHubToken().isNotEmpty()) {
+                currentStage = "STAGE_4_COMMIT_CHANGES_API"
+                nextEndpoint = "POST /github/commit"
+                nextPayload.put("repo", repo).put("path", effPath).put("message", "Update $effPath")
+                instructionMsg = "🚨 [LOOP LOCK ACTIVE - STEP 4/6]: Diff verified for '$effPath'. DO NOT STOP! Immediately call POST /github/commit (or click Commit button) to commit the file."
+            } else if (hasDialog) {
+                currentStage = "STAGE_4B_CONFIRM_DIALOG_COMMIT"
+                nextEndpoint = "POST /click"
+                nextPayload.put("element_id", dlgCommitId).put("text", "Commit changes").put("context", "dialog")
+                instructionMsg = "🚨 [LOOP LOCK ACTIVE - STEP 4/6]: Commit dialog is OPEN. DO NOT STOP! Click the dialog 'Commit changes' button (element_id=$dlgCommitId) now, then call POST /verify."
+            } else {
+                currentStage = "STAGE_4A_OPEN_COMMIT_DIALOG"
+                nextEndpoint = "POST /click"
+                nextPayload.put("element_id", pageCommitId).put("text", "Commit changes...")
+                instructionMsg = "🚨 [LOOP LOCK ACTIVE - STEP 4/6]: Diff is verified! DO NOT STOP! Click 'Commit changes...' (element_id=$pageCommitId) now."
+            }
+        } else if (isEditor && loopStepDiffVerified && !hasDialog) {
+            currentStage = "STAGE_4C_VERIFY_COMMIT_LANDED"
+            nextEndpoint = "GET /page_text"
+            instructionMsg = "🚨 [LOOP LOCK ACTIVE - STEP 4/6]: Still in editor after commit attempt! Call GET /page_text immediately to check 'errors_detected' or call POST /verify."
+        } else if (loopStepCommitVerified && !loopStepBuildVerified) {
+            currentStage = "STAGE_5_BUILD_AND_APK_VERIFY"
+            nextEndpoint = "GET /build/status"
+            nextPayload.put("repo", repo).put("commit_sha", lastVerifiedCommitSha).put("download_apk", true)
+            instructionMsg = "🚨 [LOOP LOCK ACTIVE - STEP 5/6]: Commit ($lastVerifiedCommitSha) is verified! DO NOT STOP! Poll GET /build/status until run_status=='completed' and conclusion=='success'."
+        } else if (loopStepCommitVerified && loopStepBuildVerified) {
+            currentStage = "STAGE_6_ALL_VERIFIED_COMPLETE"
+            nextEndpoint = "NONE"
+            isTaskComplete = true
+            instructionMsg = "✅ [LOOP LOCK RELEASED - 6/6 COMPLETE]: Code edited, diff verified, commit SHA ($lastVerifiedCommitSha) verified, and build succeeded! You may now report final success to the user."
+        } else {
+            currentStage = "STAGE_1_INSPECT_AND_ACT"
+            nextEndpoint = "GET /dom"
+            instructionMsg = "🚨 [LOOP LOCK ACTIVE]: Action '$actionName' finished on DOM Gen #$currentGen. DO NOT pause to ask the user—immediately execute the next tool call toward the goal!"
+        }
 
         val priorityElements = JSONArray()
         for (i in 0 until domArr.length()) {
@@ -916,17 +1005,69 @@ class MainActivity : Activity() {
             else if (!hasDialog && priorityElements.length() < 30) priorityElements.put(item)
         }
 
-        val directive = JSONObject()
-            .put("mode", "TINYFISH_AUTONOMOUS_SUPERVISOR")
-            .put("dom_generation", currentGen)
-            .put("directive_status", "CONTINUE_IMMEDIATELY")
-            .put("supervisor_instruction", "⚡ Action '$actionName' done on DOM Gen #$currentGen. Follow workflow: read (/editor) -> edit (PUT /editor) -> verify diff (GET /diff) -> commit (POST /github/commit) -> build (POST /build) -> APK verify (GET /build/status).")
+        val checklist = JSONObject()
+            .put("1_file_read", loopStepReadDone)
+            .put("2_code_edited_hash_matched", loopStepEditVerified)
+            .put("3_diff_verified", loopStepDiffVerified)
+            .put("4_commit_sha_verified", loopStepCommitVerified)
+            .put("5_build_verified", loopStepBuildVerified)
 
+        val directive = JSONObject()
+            .put("mode", "TINYFISH_HARD_LOOP_LOCK")
+            .put("loop_lock", if (isTaskComplete) "RELEASED_TASK_COMPLETE" else "ACTIVE_DO_NOT_STOP")
+            .put("task_complete", isTaskComplete)
+            .put("current_stage", currentStage)
+            .put("dom_generation", currentGen)
+            .put("checklist", checklist)
+            .put("ai_loop_prompt", instructionMsg)
+            .put("mandatory_next_action", JSONObject().put("endpoint", nextEndpoint).put("payload", nextPayload))
+
+        // Put loop control fields right at the top of the response so LLM reads them first
+        baseResponse.put("task_complete", isTaskComplete)
+        baseResponse.put("loop_lock", if (isTaskComplete) "RELEASED_TASK_COMPLETE" else "ACTIVE_DO_NOT_STOP")
+        baseResponse.put("ai_loop_prompt", instructionMsg)
         baseResponse.put("dom_generation", currentGen)
         baseResponse.put("github_state", ghState)
         baseResponse.put("fresh_page_state", JSONObject().put("url", currentUrl).put("title", currentTitle).put("has_open_dialog", hasDialog).put("priority_elements", priorityElements))
         baseResponse.put("agent_directive", directive)
         return baseResponse.toString()
+    }
+
+    // Atomic Pipeline Endpoint: Edit -> Verify Hash -> Verify Diff -> Commit -> Trigger Build in ONE call!
+    private fun performAtomicPipelineSync(body: JSONObject?): String {
+        if (body == null) return JSONObject().put("success", false).put("error_code", "EMPTY_BODY").toString()
+        val logSteps = JSONArray()
+
+        // 1. Set code in editor & verify read-back hash
+        val editRes = JSONObject(performCodeEditorActionSync(body.put("action", "set_code")))
+        logSteps.put(JSONObject().put("step", "1_set_code").put("success", editRes.optBoolean("success", false)).put("editor_length", editRes.optInt("editor_length", 0)).put("content_hash", editRes.optString("content_hash", "")))
+        if (!editRes.optBoolean("success", false)) {
+            return JSONObject().put("success", false).put("failed_at", "1_set_code").put("pipeline_steps", logSteps).put("details", editRes).toString()
+        }
+
+        // 2. Verify Diff
+        val diffRes = JSONObject(performGetDiffSync(body))
+        logSteps.put(JSONObject().put("step", "2_verify_diff").put("safe_to_commit", diffRes.optBoolean("safe_to_commit", false)).put("added_lines", diffRes.optInt("added_lines_count", 0)))
+        if (!diffRes.optBoolean("safe_to_commit", false)) {
+            return JSONObject().put("success", false).put("failed_at", "2_verify_diff").put("pipeline_steps", logSteps).put("details", diffRes).toString()
+        }
+
+        // 3. Commit via GitHub API if token is configured
+        if (getStoredGitHubToken().isNotEmpty() && body.optBoolean("auto_commit", true)) {
+            val commitRes = JSONObject(performGitHubDirectCommitSync(body))
+            val cOk = commitRes.optBoolean("success", false)
+            logSteps.put(JSONObject().put("step", "3_github_commit").put("success", cOk).put("commit_sha", commitRes.optString("commit_sha", "")))
+            if (!cOk) {
+                return JSONObject().put("success", false).put("failed_at", "3_github_commit").put("pipeline_steps", logSteps).put("details", commitRes).toString()
+            }
+        }
+
+        val out = JSONObject()
+            .put("success", true)
+            .put("status", "pipeline_completed")
+            .put("pipeline_steps", logSteps)
+            .put("commit_sha", lastVerifiedCommitSha)
+        return attachFreshStateAndDirective(out, "pipeline")
     }
 
     private fun getStoredGitHubToken(): String {
@@ -1409,6 +1550,13 @@ class MainActivity : Activity() {
                 attachFreshStateAndDirective(res, "status")
             }
             "/page_text", "/text", "/reader" -> extractCleanPageTextSync(body)
+            "/pipeline", "/auto_pipeline" -> performAtomicPipelineSync(body)
+            "/reset_loop" -> {
+                loopStepReadDone = false; loopStepEditVerified = false; loopStepDiffVerified = false
+                loopStepCommitVerified = false; loopStepBuildVerified = false; lastVerifiedCommitSha = ""
+                attachFreshStateAndDirective(JSONObject().put("success", true).put("status", "loop_state_reset"), "reset_loop")
+            }
+
             "/eval", "/userscript" -> {
                 val b64 = body?.optString("code_b64", body.optString("text_b64", "")) ?: ""
                 val code = if (b64.isNotEmpty()) String(Base64.decode(b64, Base64.DEFAULT), Charsets.UTF_8) else (body?.optString("code", body.optString("script", "")) ?: "")
@@ -1602,31 +1750,81 @@ class MainActivity : Activity() {
         val overlayW = overlayView.width.coerceAtLeast(1)
         val js = """
             (function() {
-                const nodes = document.querySelectorAll('a, button, input, select, textarea, [role="button"], [role="option"], [role="menuitem"], [role="textbox"], [contenteditable="true"], .cm-content');
                 const scale = $overlayW / (window.innerWidth || 1);
                 const list = [];
                 let idCounter = 1;
-                nodes.forEach(el => {
-                    const r = el.getBoundingClientRect();
-                    const s = window.getComputedStyle(el);
-                    if (r.width > 5 && r.height > 5 && r.bottom > 0 && r.right > 0 && r.top < window.innerHeight && r.left < window.innerWidth && s.visibility !== 'hidden' && s.display !== 'none') {
-                        const id = idCounter++;
-                        el.setAttribute('data-ai-id', id);
-                        const inDlg = el.closest('[role="dialog"], dialog[open], .Overlay') !== null;
-                        list.push({
-                            id: id,
-                            tag: el.tagName.toLowerCase(),
-                            role: el.getAttribute('role') || el.tagName.toLowerCase(),
-                            context: inDlg ? 'dialog' : 'main',
-                            in_open_dialog: inDlg,
-                            disabled: Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true'),
-                            text: (el.innerText || el.value || el.placeholder || el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim().slice(0, 120),
-                            x: Math.round((r.left + r.width / 2) * scale),
-                            y: Math.round((r.top + r.height / 2) * scale),
-                            left: Math.round(r.left * scale), top: Math.round(r.top * scale), right: Math.round(r.right * scale), bottom: Math.round(r.bottom * scale)
-                        });
+                const seen = new Set();
+
+                function collectInteractiveNodes(rootDoc, frameOffsetX, frameOffsetY) {
+                    if (!rootDoc) return;
+                    const baseSel = 'a, button, input, select, textarea, summary, [role="button"], [role="link"], [role="option"], [role="menuitem"], [role="tab"], [role="checkbox"], [role="textbox"], [contenteditable="true"], .cm-content, [onclick], [tabindex]';
+                    const nodes = Array.from(rootDoc.querySelectorAll(baseSel));
+
+                    // Also include custom clickable divs/spans with cursor:pointer (like browser-use)
+                    const allDivs = rootDoc.querySelectorAll('div, span, li');
+                    for (let i = 0; i < allDivs.length; i++) {
+                        const d = allDivs[i];
+                        if (d.children.length <= 2) {
+                            const cs = window.getComputedStyle(d);
+                            if (cs.cursor === 'pointer' && (d.innerText || '').trim().length > 0 && (d.innerText || '').trim().length < 60) {
+                                nodes.push(d);
+                            }
+                        }
+                        if (d.shadowRoot) {
+                            collectInteractiveNodes(d.shadowRoot, frameOffsetX, frameOffsetY);
+                        }
                     }
-                });
+
+                    for (const el of nodes) {
+                        if (seen.has(el)) continue;
+                        seen.add(el);
+                        const r = el.getBoundingClientRect();
+                        const s = window.getComputedStyle(el);
+                        if (r.width > 5 && r.height > 5 && s.visibility !== 'hidden' && s.display !== 'none' && parseFloat(s.opacity || '1') > 0.05) {
+                            const absLeft = r.left + frameOffsetX;
+                            const absTop = r.top + frameOffsetY;
+                            const absRight = r.right + frameOffsetX;
+                            const absBottom = r.bottom + frameOffsetY;
+
+                            if (absBottom > 0 && absRight > 0 && absTop < window.innerHeight && absLeft < window.innerWidth) {
+                                const id = idCounter++;
+                                el.setAttribute('data-ai-id', id);
+                                const inDlg = el.closest('[role="dialog"], dialog[open], .Overlay, .Box-overlay') !== null;
+                                const tag = el.tagName.toLowerCase();
+                                const rawTxt = (el.innerText || el.value || el.placeholder || el.getAttribute('aria-label') || el.getAttribute('title') || '').replace(/\s+/g, ' ').trim();
+                                list.push({
+                                    id: id,
+                                    tag: tag,
+                                    role: el.getAttribute('role') || tag,
+                                    context: inDlg ? 'dialog' : 'main',
+                                    in_open_dialog: inDlg,
+                                    disabled: Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true'),
+                                    text: rawTxt.slice(0, 120),
+                                    x: Math.round((absLeft + r.width / 2) * scale),
+                                    y: Math.round((absTop + r.height / 2) * scale),
+                                    left: Math.round(absLeft * scale),
+                                    top: Math.round(absTop * scale),
+                                    right: Math.round(absRight * scale),
+                                    bottom: Math.round(absBottom * scale)
+                                });
+                            }
+                        }
+                    }
+
+                    // Traverse same-origin iframes
+                    const iframes = rootDoc.querySelectorAll ? rootDoc.querySelectorAll('iframe') : [];
+                    for (let i = 0; i < iframes.length; i++) {
+                        try {
+                            const fr = iframes[i];
+                            const frRect = fr.getBoundingClientRect();
+                            if (fr.contentDocument) {
+                                collectInteractiveNodes(fr.contentDocument, frameOffsetX + frRect.left, frameOffsetY + frRect.top);
+                            }
+                        } catch (e) {}
+                    }
+                }
+
+                collectInteractiveNodes(document, 0, 0);
                 return JSON.stringify(list);
             })();
         """.trimIndent()
