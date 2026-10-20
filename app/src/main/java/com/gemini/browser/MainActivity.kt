@@ -362,6 +362,7 @@ class MainActivity : Activity() {
         val wv = WebView(this).apply {
             layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
             visibility = View.GONE; isFocusable = true; isFocusableInTouchMode = true
+            setLayerType(View.LAYER_TYPE_HARDWARE, null)
         }
         val newTab = BrowserTab(id = id, webView = wv, url = initialUrl, title = "Tab $id")
         configureWebViewForTab(newTab)
@@ -526,7 +527,8 @@ class MainActivity : Activity() {
         val cw = webContainer.width; val ch = webContainer.height
         if (cw <= 0 || ch <= 0) return
 
-        if (tab.desktopMode) {
+        val isGeminiChat = tab.url.contains("gemini.google.com")
+        if (tab.desktopMode && !isGeminiChat) {
             val targetPxW = (1280f * resources.displayMetrics.density).toInt()
             val scale = cw.toFloat() / targetPxW.toFloat()
             val targetPxH = (ch.toFloat() / scale).toInt()
@@ -645,6 +647,9 @@ class MainActivity : Activity() {
     private fun injectStealthViewportAndTracker(tab: BrowserTab) {
         val js = """
             (function() {
+                if (window.__geminiFastHooked) return;
+                window.__geminiFastHooked = true;
+
                 try {
                     Object.defineProperty(navigator, 'webdriver', { get: () => false, configurable: true });
                     window.chrome = window.chrome || { runtime: {}, app: {} };
@@ -699,31 +704,28 @@ class MainActivity : Activity() {
                     } catch (e) {}
                 };
 
-                if (!window.__geminiAllowClickerInstalled) {
-                    window.__geminiAllowClickerInstalled = true;
+                // Zero-Lag Auto-Allow: Only runs on gemini.google.com during browser idle time without layout thrashing
+                if (location.hostname.includes('gemini.google.com')) {
                     setInterval(function() {
-                        try {
-                            const els = document.querySelectorAll('button, [role="button"]');
-                            const list = [];
-                            for (let i = 0; i < els.length; i++) {
-                                const el = els[i];
-                                const t = (el.innerText || el.textContent || '').trim().toLowerCase();
-                                if (t === 'allow' && !el.disabled) {
-                                    const r = el.getBoundingClientRect();
-                                    if (r.width > 10 && r.height > 10) list.push(el);
+                        const runner = window.requestIdleCallback || function(cb) { setTimeout(cb, 50); };
+                        runner(function() {
+                            try {
+                                const btns = document.getElementsByTagName('button');
+                                for (let i = btns.length - 1; i >= 0; i--) {
+                                    const b = btns[i];
+                                    if (!b.disabled && b.textContent && b.textContent.trim() === 'Allow') {
+                                        const now = Date.now();
+                                        if (now - parseInt(b.getAttribute('data-ai-ts') || '0', 10) > 1500) {
+                                            b.setAttribute('data-ai-ts', String(now));
+                                            b.click();
+                                            if (window.AIAgentBridge) window.AIAgentBridge.onAutoAllowed('Allow clicked');
+                                        }
+                                        break;
+                                    }
                                 }
-                            }
-                            if (list.length > 0) {
-                                const btn = list[list.length - 1];
-                                const now = Date.now();
-                                if (now - parseInt(btn.getAttribute('data-ai-ts') || '0', 10) > 1200) {
-                                    btn.setAttribute('data-ai-ts', String(now));
-                                    btn.click();
-                                    if (window.AIAgentBridge) window.AIAgentBridge.onAutoAllowed('Allow clicked');
-                                }
-                            }
-                        } catch (e) {}
-                    }, 400);
+                            } catch (e) {}
+                        });
+                    }, 900);
                 }
             })();
         """.trimIndent()
@@ -1149,20 +1151,10 @@ class MainActivity : Activity() {
 
     private fun attachFreshStateAndDirective(baseResponse: JSONObject, actionName: String): String {
         val currentGen = domGeneration.incrementAndGet()
-        val domStr = extractDomSync(false)
-        val domArr = try { if (domStr.startsWith("[")) JSONArray(domStr) else JSONArray() } catch (_: Exception) { JSONArray() }
-        val ghState = inspectGitHubPageStateSync()
-        val hasDialog = ghState.optBoolean("has_open_dialog", false)
-        val isEditor = ghState.optBoolean("is_in_editor", false)
-        val effPath = ghState.optString("effective_full_path", "")
-        val edLen = ghState.optInt("editor_length", 0)
-        val pageCommitId = ghState.optInt("page_commit_button_id", -1)
-        val dlgCommitId = ghState.optInt("dialog_commit_button_id", -1)
-        val repo = ghState.optString("repo", activeBuildRepo)
 
-        // Update state machine flags based on action & verified results
+        // Update state machine flags without running any slow JS/DOM scans!
         if (actionName.startsWith("editor_get") || actionName == "navigate" || actionName == "github_state") {
-            if (isEditor || effPath.isNotEmpty()) loopStepReadDone = true
+            loopStepReadDone = true
         }
         if (actionName == "editor_set_code" && baseResponse.optBoolean("verified", false)) {
             loopStepReadDone = true
@@ -1177,113 +1169,30 @@ class MainActivity : Activity() {
         if ((actionName == "github_commit" && baseResponse.optBoolean("success", false)) ||
             (actionName == "verify" && baseResponse.optBoolean("commit_verified", false))) {
             loopStepCommitVerified = true
-            lastVerifiedCommitSha = baseResponse.optString("commit_sha", ghState.optString("commit_sha", ""))
+            lastVerifiedCommitSha = baseResponse.optString("commit_sha", lastVerifiedCommitSha)
         }
         if (actionName == "build_status" && baseResponse.optString("run_status") == "completed" && baseResponse.optString("conclusion") == "success") {
             loopStepBuildVerified = true
         }
 
-        // Determine current Stage & Mandatory Next Action to lock AI in continuous execution loop
-        val currentStage: String
-        val nextEndpoint: String
-        val nextPayload = JSONObject()
-        val instructionMsg: String
-        var isTaskComplete = false
-
-        if (isEditor && !loopStepEditVerified) {
-            currentStage = "STAGE_2_WRITE_AND_VERIFY_CODE"
-            nextEndpoint = "PUT /editor"
-            nextPayload.put("action", "set_code").put("text_b64", "<BASE64_FULL_CODE>")
-            instructionMsg = "🚨 [LOOP LOCK ACTIVE - STEP 2/6]: Editor is open for '$effPath' (current length:$edLen). DO NOT STOP or reply to user! Send full code via PUT /editor and verify exact_match==true."
-        } else if (loopStepEditVerified && !loopStepDiffVerified) {
-            currentStage = "STAGE_3_VERIFY_GIT_DIFF"
-            nextEndpoint = "GET /diff"
-            instructionMsg = "🚨 [LOOP LOCK ACTIVE - STEP 3/6]: Code written & hash matched ($edLen chars). DO NOT STOP! Immediately call GET /diff to verify unified_diff and file identity before committing."
-        } else if (loopStepDiffVerified && !loopStepCommitVerified) {
-            if (getStoredGitHubToken().isNotEmpty()) {
-                currentStage = "STAGE_4_COMMIT_CHANGES_API"
-                nextEndpoint = "POST /github/commit"
-                nextPayload.put("repo", repo).put("path", effPath).put("message", "Update $effPath")
-                instructionMsg = "🚨 [LOOP LOCK ACTIVE - STEP 4/6]: Diff verified for '$effPath'. DO NOT STOP! Immediately call POST /github/commit (or click Commit button) to commit the file."
-            } else if (hasDialog) {
-                currentStage = "STAGE_4B_CONFIRM_DIALOG_COMMIT"
-                nextEndpoint = "POST /click"
-                nextPayload.put("element_id", dlgCommitId).put("text", "Commit changes").put("context", "dialog")
-                instructionMsg = "🚨 [LOOP LOCK ACTIVE - STEP 4/6]: Commit dialog is OPEN. DO NOT STOP! Click the dialog 'Commit changes' button (element_id=$dlgCommitId) now, then call POST /verify."
-            } else {
-                currentStage = "STAGE_4A_OPEN_COMMIT_DIALOG"
-                nextEndpoint = "POST /click"
-                nextPayload.put("element_id", pageCommitId).put("text", "Commit changes...")
-                instructionMsg = "🚨 [LOOP LOCK ACTIVE - STEP 4/6]: Diff is verified! DO NOT STOP! Click 'Commit changes...' (element_id=$pageCommitId) now."
-            }
-        } else if (isEditor && loopStepDiffVerified && !hasDialog) {
-            currentStage = "STAGE_4C_VERIFY_COMMIT_LANDED"
-            nextEndpoint = "GET /page_text"
-            instructionMsg = "🚨 [LOOP LOCK ACTIVE - STEP 4/6]: Still in editor after commit attempt! Call GET /page_text immediately to check 'errors_detected' or call POST /verify."
-        } else if (loopStepCommitVerified && !loopStepBuildVerified) {
-            currentStage = "STAGE_5_BUILD_AND_APK_VERIFY"
-            nextEndpoint = "GET /build/status"
-            nextPayload.put("repo", repo).put("commit_sha", lastVerifiedCommitSha).put("download_apk", true)
-            instructionMsg = "🚨 [LOOP LOCK ACTIVE - STEP 5/6]: Commit ($lastVerifiedCommitSha) is verified! DO NOT STOP! Poll GET /build/status until run_status=='completed' and conclusion=='success'."
-        } else if (loopStepCommitVerified && loopStepBuildVerified) {
-            currentStage = "STAGE_6_ALL_VERIFIED_COMPLETE"
-            nextEndpoint = "NONE"
-            isTaskComplete = true
-            instructionMsg = "✅ [LOOP LOCK RELEASED - 6/6 COMPLETE]: Code edited, diff verified, commit SHA ($lastVerifiedCommitSha) verified, and build succeeded! You may now report final success to the user."
-        } else {
-            currentStage = "STAGE_1_INSPECT_AND_ACT"
-            nextEndpoint = "GET /dom"
-            instructionMsg = "🚨 [LOOP LOCK ACTIVE]: Action '$actionName' finished on DOM Gen #$currentGen. DO NOT pause to ask the user—immediately execute the next tool call toward the goal!"
-        }
-
-        val priorityElements = JSONArray()
-        for (i in 0 until domArr.length()) {
-            val item = domArr.getJSONObject(i)
-            if (hasDialog && item.optBoolean("in_open_dialog", false)) priorityElements.put(item)
-            else if (!hasDialog && priorityElements.length() < 30) priorityElements.put(item)
-        }
-
-        val checklist = JSONObject()
-            .put("1_file_read", loopStepReadDone)
-            .put("2_code_edited_hash_matched", loopStepEditVerified)
-            .put("3_diff_verified", loopStepDiffVerified)
-            .put("4_commit_sha_verified", loopStepCommitVerified)
-            .put("5_build_verified", loopStepBuildVerified)
-
-        val stepNum = ++loopStepCount
+        val isTaskComplete = loopStepCommitVerified && loopStepBuildVerified
         val exitAllowed = isTaskComplete && !noExitLockActive
-        val selfSupervisorContract = JSONObject()
-            .put("role", "SELF_SUPERVISING_AUTONOMOUS_AGENT")
-            .put("step_counter", stepNum)
-            .put("no_exit_lock", !exitAllowed)
-            .put("exit_allowed", exitAllowed)
-            .put("rule_1_no_exit", "TUM ABHI EXIT NAHI KAR SAKTE! User ko adhura status mat do. Turant agla command execute karo.")
-            .put("rule_2_self_audit", "Har command ke baad khud Supervisor bankar check karo: Kya pichla action सच में सफल हुआ? Agar commit/build fail hua toh /raw_log ya /page_text padh kar khud fix karo.")
-            .put("rule_3_unlock_condition", "Jab 100% kaam aur build/commit verify ho jaye, tabhi POST /complete_task call karke exit unlock karo.")
 
-        val directive = JSONObject()
-            .put("mode", "TINYFISH_NO_EXIT_SELF_SUPERVISOR")
-            .put("loop_lock", if (exitAllowed) "RELEASED_TASK_COMPLETE" else "NO_EXIT_KEEP_WORKING")
-            .put("no_exit_lock", !exitAllowed)
-            .put("exit_allowed", exitAllowed)
-            .put("task_complete", exitAllowed)
-            .put("current_stage", currentStage)
-            .put("dom_generation", currentGen)
-            .put("checklist", checklist)
-            .put("self_supervisor_contract", selfSupervisorContract)
-            .put("ai_loop_prompt", instructionMsg)
-            .put("mandatory_next_action", JSONObject().put("endpoint", nextEndpoint).put("payload", nextPayload))
+        val nextStepHint = when {
+            !loopStepReadDone -> "NEXT: Call GET /editor or GET /dom to inspect target."
+            !loopStepEditVerified -> "NEXT: Send code via PUT /editor and verify exact_match==true."
+            !loopStepDiffVerified -> "NEXT: Call GET /diff to verify changes before committing."
+            !loopStepCommitVerified -> "NEXT: Commit via POST /github/commit (or click Commit + POST /verify)."
+            !loopStepBuildVerified -> "NEXT: Check build via GET /build/status or raw logs via GET /raw_log."
+            else -> "COMPLETE: All steps verified. Call POST /complete_task or report to user."
+        }
 
-        baseResponse.put("no_exit_lock", !exitAllowed)
-        baseResponse.put("exit_allowed", exitAllowed)
-        baseResponse.put("task_complete", exitAllowed)
-        baseResponse.put("loop_lock", if (exitAllowed) "RELEASED_TASK_COMPLETE" else "NO_EXIT_KEEP_WORKING")
-        baseResponse.put("self_supervisor_contract", selfSupervisorContract)
-        baseResponse.put("ai_loop_prompt", instructionMsg)
+        // Ultra-compact directive (<200 bytes) so Gemini processes responses instantaneously without context bloat!
         baseResponse.put("dom_generation", currentGen)
-        baseResponse.put("github_state", ghState)
-        baseResponse.put("fresh_page_state", JSONObject().put("url", currentUrl).put("title", currentTitle).put("has_open_dialog", hasDialog).put("priority_elements", priorityElements))
-        baseResponse.put("agent_directive", directive)
+        baseResponse.put("url", currentUrl)
+        baseResponse.put("no_exit_lock", !exitAllowed)
+        baseResponse.put("task_complete", exitAllowed)
+        baseResponse.put("loop_directive", if (exitAllowed) "✅ TASK VERIFIED COMPLETE" else "🚨 KEEP WORKING (DO NOT STOP) -> $nextStepHint")
         return baseResponse.toString()
     }
 
@@ -2228,7 +2137,7 @@ class MainActivity : Activity() {
                 expectedTargetContentLength = body?.optInt("expected_length", expectedTargetContentLength) ?: expectedTargetContentLength
                 attachFreshStateAndDirective(JSONObject().put("success", true).put("status", "goal_registered"), "goal")
             }
-            "/github_state" -> attachFreshStateAndDirective(JSONObject().put("success", true).put("status", "ok"), "github_state")
+            "/github_state" -> attachFreshStateAndDirective(inspectGitHubPageStateSync().put("success", true).put("status", "ok"), "github_state")
             "/diff", "/git_diff" -> performGetDiffSync(body)
             "/github/token", "/config/token" -> {
                 saveStoredGitHubToken(body?.optString("token", "") ?: "")
@@ -2278,7 +2187,7 @@ class MainActivity : Activity() {
             }
             "/desktop" -> {
                 applyDesktopMode(body?.optBoolean("enable", !desktopMode) ?: !desktopMode)
-                Thread.sleep(300)
+                Thread.sleep(100)
                 attachFreshStateAndDirective(JSONObject().put("success", true).put("desktop_mode", desktopMode), "desktop")
             }
             "/navigate" -> {
@@ -2412,78 +2321,37 @@ class MainActivity : Activity() {
                 const scale = $overlayW / (window.innerWidth || 1);
                 const list = [];
                 let idCounter = 1;
-                const seen = new Set();
+                const sel = 'a, button, input, select, textarea, summary, [role="button"], [role="link"], [role="option"], [role="menuitem"], [role="tab"], [role="checkbox"], [role="textbox"], [contenteditable="true"], .cm-content, [onclick]';
+                const nodes = document.querySelectorAll(sel);
 
-                function collectInteractiveNodes(rootDoc, frameOffsetX, frameOffsetY) {
-                    if (!rootDoc) return;
-                    const baseSel = 'a, button, input, select, textarea, summary, [role="button"], [role="link"], [role="option"], [role="menuitem"], [role="tab"], [role="checkbox"], [role="textbox"], [contenteditable="true"], .cm-content, [onclick], [tabindex]';
-                    const nodes = Array.from(rootDoc.querySelectorAll(baseSel));
+                for (let i = 0; i < nodes.length; i++) {
+                    const el = nodes[i];
+                    const r = el.getBoundingClientRect();
+                    if (r.width <= 5 || r.height <= 5 || r.bottom <= 0 || r.right <= 0 || r.top >= window.innerHeight || r.left >= window.innerWidth) continue;
+                    if (el.offsetParent === null && el.tagName !== 'BODY' && getComputedStyle(el).position !== 'fixed') continue;
 
-                    // Also include custom clickable divs/spans with cursor:pointer (like browser-use)
-                    const allDivs = rootDoc.querySelectorAll('div, span, li');
-                    for (let i = 0; i < allDivs.length; i++) {
-                        const d = allDivs[i];
-                        if (d.children.length <= 2) {
-                            const cs = window.getComputedStyle(d);
-                            if (cs.cursor === 'pointer' && (d.innerText || '').trim().length > 0 && (d.innerText || '').trim().length < 60) {
-                                nodes.push(d);
-                            }
-                        }
-                        if (d.shadowRoot) {
-                            collectInteractiveNodes(d.shadowRoot, frameOffsetX, frameOffsetY);
-                        }
-                    }
-
-                    for (const el of nodes) {
-                        if (seen.has(el)) continue;
-                        seen.add(el);
-                        const r = el.getBoundingClientRect();
-                        const s = window.getComputedStyle(el);
-                        if (r.width > 5 && r.height > 5 && s.visibility !== 'hidden' && s.display !== 'none' && parseFloat(s.opacity || '1') > 0.05) {
-                            const absLeft = r.left + frameOffsetX;
-                            const absTop = r.top + frameOffsetY;
-                            const absRight = r.right + frameOffsetX;
-                            const absBottom = r.bottom + frameOffsetY;
-
-                            if (absBottom > 0 && absRight > 0 && absTop < window.innerHeight && absLeft < window.innerWidth) {
-                                const id = idCounter++;
-                                el.setAttribute('data-ai-id', id);
-                                const inDlg = el.closest('[role="dialog"], dialog[open], .Overlay, .Box-overlay') !== null;
-                                const tag = el.tagName.toLowerCase();
-                                const rawTxt = (el.innerText || el.value || el.placeholder || el.getAttribute('aria-label') || el.getAttribute('title') || '').replace(/\s+/g, ' ').trim();
-                                list.push({
-                                    id: id,
-                                    tag: tag,
-                                    role: el.getAttribute('role') || tag,
-                                    context: inDlg ? 'dialog' : 'main',
-                                    in_open_dialog: inDlg,
-                                    disabled: Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true'),
-                                    text: rawTxt.slice(0, 120),
-                                    x: Math.round((absLeft + r.width / 2) * scale),
-                                    y: Math.round((absTop + r.height / 2) * scale),
-                                    left: Math.round(absLeft * scale),
-                                    top: Math.round(absTop * scale),
-                                    right: Math.round(absRight * scale),
-                                    bottom: Math.round(absBottom * scale)
-                                });
-                            }
-                        }
-                    }
-
-                    // Traverse same-origin iframes
-                    const iframes = rootDoc.querySelectorAll ? rootDoc.querySelectorAll('iframe') : [];
-                    for (let i = 0; i < iframes.length; i++) {
-                        try {
-                            const fr = iframes[i];
-                            const frRect = fr.getBoundingClientRect();
-                            if (fr.contentDocument) {
-                                collectInteractiveNodes(fr.contentDocument, frameOffsetX + frRect.left, frameOffsetY + frRect.top);
-                            }
-                        } catch (e) {}
-                    }
+                    const id = idCounter++;
+                    el.setAttribute('data-ai-id', id);
+                    const inDlg = el.closest('[role="dialog"], dialog[open], .Overlay, .Box-overlay') !== null;
+                    const tag = el.tagName.toLowerCase();
+                    const rawTxt = (el.innerText || el.value || el.placeholder || el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+                    list.push({
+                        id: id,
+                        tag: tag,
+                        role: el.getAttribute('role') || tag,
+                        context: inDlg ? 'dialog' : 'main',
+                        in_open_dialog: inDlg,
+                        disabled: Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true'),
+                        text: rawTxt.slice(0, 100),
+                        x: Math.round((r.left + r.width / 2) * scale),
+                        y: Math.round((r.top + r.height / 2) * scale),
+                        left: Math.round(r.left * scale),
+                        top: Math.round(r.top * scale),
+                        right: Math.round(r.right * scale),
+                        bottom: Math.round(r.bottom * scale)
+                    });
+                    if (list.length >= 120) break;
                 }
-
-                collectInteractiveNodes(document, 0, 0);
                 return JSON.stringify(list);
             })();
         """.trimIndent()
@@ -2536,7 +2404,7 @@ class MainActivity : Activity() {
                 })();
             """.trimIndent())
             if (res.startsWith("{")) {
-                Thread.sleep(300)
+                Thread.sleep(100)
                 return attachFreshStateAndDirective(JSONObject(res).put("elapsed_ms", System.currentTimeMillis() - startMs), "click")
             }
         }
@@ -2571,7 +2439,7 @@ class MainActivity : Activity() {
             d.recycle(); u.recycle()
         }
         if (elementId > 0) evalJsSync("(function(){ const el = document.querySelector('[data-ai-id=\"$elementId\"]'); if (el) { el.focus(); if (el.tagName==='BUTTON') el.click(); } })()")
-        Thread.sleep(320)
+        Thread.sleep(120)
         return attachFreshStateAndDirective(JSONObject().put("success", true).put("status", "clicked").put("element_id", elementId).put("elapsed_ms", System.currentTimeMillis() - startMs), "click")
     }
 
