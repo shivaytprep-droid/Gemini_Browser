@@ -7,6 +7,7 @@ import android.app.DownloadManager
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.content.SharedPreferences
 import android.graphics.*
 import android.net.Uri
@@ -48,7 +49,9 @@ class MainActivity : Activity() {
         @Volatile var title: String = "New Tab",
         @Volatile var desktopMode: Boolean = true,
         @Volatile var isPageLoading: Boolean = false,
-        @Volatile var isNetworkIdle: Boolean = true
+        @Volatile var isNetworkIdle: Boolean = true,
+        @Volatile var dedicatedPort: Int = 0,
+        @Transient var dedicatedSocket: ServerSocket? = null
     )
 
     private lateinit var tabBarContainer: LinearLayout
@@ -64,7 +67,12 @@ class MainActivity : Activity() {
     private val tabs = CopyOnWriteArrayList<BrowserTab>()
     private val nextTabId = AtomicInteger(1)
     private val domGeneration = AtomicInteger(1)
-    @Volatile private var activeTab: BrowserTab? = null
+    private val threadBoundTab = ThreadLocal<BrowserTab?>()
+    @Volatile private var uiActiveTab: BrowserTab? = null
+    private var activeTab: BrowserTab?
+        get() = threadBoundTab.get() ?: uiActiveTab
+        set(value) { uiActiveTab = value }
+    private var portBtn: Button? = null
 
     @Volatile private var activeGoalDescription: String = "Autonomous Coding & Build Workflow"
     @Volatile private var expectedTargetFilePath: String = ""
@@ -108,10 +116,13 @@ class MainActivity : Activity() {
     private val mobileUA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
     private val desktopUA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
+    @Volatile private var mainServerPort: Int = 8795
+    private val SERVER_PORT: Int
+        get() = threadBoundTab.get()?.dedicatedPort?.takeIf { it > 0 } ?: mainServerPort
+    private val serverStarted = AtomicBoolean(false)
+    @Volatile private var serverSocket: ServerSocket? = null
+
     companion object {
-        private const val SERVER_PORT = 8795
-        private val serverStarted = AtomicBoolean(false)
-        @Volatile private var serverSocket: ServerSocket? = null
         @Volatile private var activeInstance: MainActivity? = null
     }
 
@@ -128,9 +139,13 @@ class MainActivity : Activity() {
             wakeLock?.acquire()
         } catch (_: Exception) {}
 
+        val intentPort = intent?.getIntExtra("custom_port", 0) ?: 0
+        mainServerPort = if (intentPort in 1024..65535) intentPort else prefs.getInt("saved_main_port", 8795)
+        val startUrl = intent?.getStringExtra("initial_url")?.takeIf { it.isNotBlank() } ?: "https://gemini.google.com"
+
         CookieManager.getInstance().setAcceptCookie(true)
         buildUserInterface()
-        createNewTab("https://gemini.google.com", switchToIt = true)
+        createNewTab(startUrl, switchToIt = true)
         mainHandler.postDelayed({ updateWebViewViewportBounds() }, 150)
         ensureServerRunning()
     }
@@ -303,8 +318,10 @@ class MainActivity : Activity() {
             setPadding(dp(8), 0, dp(10), 0)
         }
 
+        val btnPort = makePanelButton("PORT:$mainServerPort", "#00695C", 88) { showPortAndWindowDialog() }
+        portBtn = btnPort
         consoleRow.addView(btnDom); consoleRow.addView(btnOcr); consoleRow.addView(btnVerify)
-        consoleRow.addView(btnJs); consoleRow.addView(btnLogs); consoleRow.addView(btnStop); consoleRow.addView(consoleText)
+        consoleRow.addView(btnPort); consoleRow.addView(btnJs); consoleRow.addView(btnLogs); consoleRow.addView(btnStop); consoleRow.addView(consoleText)
         consoleScroll.addView(consoleRow)
 
         webContainer = FrameLayout(this).apply {
@@ -374,7 +391,7 @@ class MainActivity : Activity() {
         val wasActive = (activeTab?.id == targetTab.id)
         tabs.remove(targetTab)
         tabViewsHolder.removeView(targetTab.webView)
-        try { targetTab.webView.stopLoading(); targetTab.webView.destroy() } catch (_: Exception) {}
+        try { targetTab.dedicatedSocket?.close(); targetTab.dedicatedSocket = null; targetTab.dedicatedPort = 0; targetTab.webView.stopLoading(); targetTab.webView.destroy() } catch (_: Exception) {}
         if (wasActive && tabs.isNotEmpty()) switchToTab(tabs[idx.coerceIn(0, tabs.size - 1)]) else refreshTabBarUi()
     }
 
@@ -403,7 +420,7 @@ class MainActivity : Activity() {
                     setOnClickListener { switchToTab(t) }
                 }
                 val titleTv = TextView(this).apply {
-                    text = "${t.id}: ${t.title.ifEmpty { t.url }.take(15)}"
+                    text = if (t.dedicatedPort > 0) "${t.id}[${t.dedicatedPort}]: ${t.title.ifEmpty { t.url }.take(12)}" else "${t.id}: ${t.title.ifEmpty { t.url }.take(15)}"
                     setTextColor(Color.WHITE); textSize = 10.5f; setSingleLine(true)
                     setPadding(0, 0, dp(6), 0)
                 }
@@ -713,26 +730,215 @@ class MainActivity : Activity() {
         tab.webView.evaluateJavascript(js, null)
     }
 
+    private fun isPortOccupied(port: Int): Boolean {
+        return try {
+            Socket().use { s ->
+                s.connect(InetSocketAddress("127.0.0.1", port), 180)
+                true
+            }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun findNextAvailablePort(startFrom: Int): Int {
+        var candidate = startFrom.coerceIn(1024, 65500)
+        for (i in 0..80) {
+            val p = candidate + i
+            if (!isPortOccupied(p)) return p
+        }
+        return candidate
+    }
+
     private fun ensureServerRunning() {
         if (serverStarted.get() && serverSocket != null && !serverSocket!!.isClosed) return
-        serverPool.execute {
-            try { serverSocket?.close() } catch (_: Exception) {}
+        rebindMainServerPort(mainServerPort, autoFallback = true, saveToPrefs = false)
+    }
+
+    @Synchronized
+    private fun rebindMainServerPort(requestedPort: Int, autoFallback: Boolean = true, saveToPrefs: Boolean = true): Int {
+        val targetPort = requestedPort.coerceIn(1024, 65535)
+        try {
+            serverStarted.set(false)
+            serverSocket?.close()
+        } catch (_: Exception) {}
+
+        var boundSock: ServerSocket? = null
+        var chosenPort = targetPort
+        val maxAttempts = if (autoFallback) 60 else 1
+
+        for (offset in 0 until maxAttempts) {
+            val tryPort = targetPort + offset
+            if (isPortOccupied(tryPort)) continue
             try {
-                val sock = ServerSocket()
-                sock.reuseAddress = true
-                sock.bind(InetSocketAddress("0.0.0.0", SERVER_PORT), 50)
-                serverSocket = sock
-                serverStarted.set(true)
-                setConsoleStatus("🟢 ONLINE 127.0.0.1:$SERVER_PORT | Ready", false)
-                while (serverStarted.get() && !sock.isClosed) {
-                    val client = sock.accept()
-                    serverPool.execute { (activeInstance ?: this@MainActivity).handleClientSocket(client) }
+                val s = ServerSocket()
+                s.reuseAddress = false
+                s.bind(InetSocketAddress("0.0.0.0", tryPort), 50)
+                boundSock = s
+                chosenPort = tryPort
+                break
+            } catch (_: Exception) {}
+        }
+
+        if (boundSock == null) {
+            setConsoleStatus("🔴 Port $targetPort busy!", true)
+            return -1
+        }
+
+        mainServerPort = chosenPort
+        serverSocket = boundSock
+        serverStarted.set(true)
+        if (saveToPrefs) {
+            prefs.edit().putInt("saved_main_port", chosenPort).apply()
+        }
+
+        mainHandler.post {
+            portBtn?.text = "PORT:$chosenPort"
+        }
+        setConsoleStatus("🟢 ONLINE 127.0.0.1:$chosenPort | Ready", false)
+        appendLog("🌐 Main Server bound to 127.0.0.1:$chosenPort")
+
+        val activeSock = boundSock
+        serverPool.execute {
+            while (serverStarted.get() && !activeSock.isClosed) {
+                try {
+                    val client = activeSock.accept()
+                    serverPool.execute {
+                        threadBoundTab.remove()
+                        handleClientSocket(client)
+                    }
+                } catch (_: Exception) {
+                    break
                 }
-            } catch (e: Exception) {
-                serverStarted.set(false)
-                setConsoleStatus("🔴 SERVER ERR: ${e.message}", true)
             }
         }
+        return chosenPort
+    }
+
+    // Binds a dedicated ServerSocket to a specific BrowserTab so it works like an independent window!
+    private fun bindDedicatedPortToTab(tab: BrowserTab, requestedPort: Int = 0): Int {
+        try {
+            tab.dedicatedSocket?.close()
+            tab.dedicatedSocket = null
+        } catch (_: Exception) {}
+
+        val startCandidate = if (requestedPort in 1024..65535 && requestedPort != mainServerPort) {
+            requestedPort
+        } else {
+            mainServerPort + tab.id
+        }
+
+        val freePort = findNextAvailablePort(startCandidate)
+        return try {
+            val tSock = ServerSocket()
+            tSock.reuseAddress = false
+            tSock.bind(InetSocketAddress("0.0.0.0", freePort), 50)
+            tab.dedicatedSocket = tSock
+            tab.dedicatedPort = freePort
+            refreshTabBarUi()
+            appendLog("❐ Tab #${tab.id} isolated on independent port $freePort")
+
+            serverPool.execute {
+                while (!tSock.isClosed && tabs.contains(tab)) {
+                    try {
+                        val client = tSock.accept()
+                        serverPool.execute {
+                            try {
+                                threadBoundTab.set(tab)
+                                handleClientSocket(client)
+                            } finally {
+                                threadBoundTab.remove()
+                            }
+                        }
+                    } catch (_: Exception) {
+                        break
+                    }
+                }
+            }
+            freePort
+        } catch (e: Exception) {
+            appendLog("Tab port bind failed: ${e.message}")
+            -1
+        }
+    }
+
+    // Launches a completely separate Android OS Window (Multi-Instance) on a conflict-free port
+    private fun spawnIndependentOsWindow(initialUrl: String, requestedPort: Int = 0, closeCurrentTab: Boolean = false): Int {
+        val nextFree = findNextAvailablePort(if (requestedPort in 1024..65535) requestedPort else mainServerPort + 1)
+        mainHandler.post {
+            try {
+                val intent = Intent(this@MainActivity, MainActivity::class.java).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_DOCUMENT or Intent.FLAG_ACTIVITY_MULTIPLE_TASK or Intent.FLAG_ACTIVITY_NEW_TASK)
+                    putExtra("initial_url", initialUrl)
+                    putExtra("custom_port", nextFree)
+                }
+                startActivity(intent)
+                if (closeCurrentTab && tabs.size > 1 && uiActiveTab != null) {
+                    closeTab(uiActiveTab!!)
+                }
+                Toast.makeText(this@MainActivity, "❐ New Window spawned on port $nextFree", Toast.LENGTH_SHORT).show()
+            } catch (e: Exception) {
+                Toast.makeText(this@MainActivity, "Window spawn error: ${e.message}", Toast.LENGTH_SHORT).show()
+            }
+        }
+        return nextFree
+    }
+
+    private fun showPortAndWindowDialog() {
+        val curTab = uiActiveTab
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(12), dp(16), dp(8))
+            setBackgroundColor(Color.parseColor("#181818"))
+        }
+
+        val infoTv = TextView(this).apply {
+            text = "🌐 Main Browser Port: $mainServerPort\n" +
+                "❐ Current Tab #${curTab?.id ?: 1} Dedicated Port: ${if ((curTab?.dedicatedPort ?: 0) > 0) curTab?.dedicatedPort else "None (Shared)"}"
+            setTextColor(Color.parseColor("#00E676"))
+            textSize = 12f
+            setPadding(0, 0, 0, dp(10))
+        }
+
+        val portInput = EditText(this).apply {
+            hint = "Enter Port (e.g. 8796, 8800)"
+            setText(mainServerPort.toString())
+            setTextColor(Color.WHITE)
+            setHintTextColor(Color.GRAY)
+            setBackgroundColor(Color.parseColor("#2A2A2A"))
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+        }
+
+        container.addView(infoTv)
+        container.addView(portInput)
+
+        AlertDialog.Builder(this)
+            .setTitle("⚡ Port & Independent Window")
+            .setView(container)
+            .setPositiveButton("Change Main Port") { _, _ ->
+                val p = portInput.text.toString().trim().toIntOrNull() ?: mainServerPort
+                serverPool.execute {
+                    val bound = rebindMainServerPort(p, autoFallback = true, saveToPrefs = true)
+                    mainHandler.post {
+                        Toast.makeText(this@MainActivity, "Main Port set to $bound", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+            .setNeutralButton("Isolate Tab on Port") { _, _ ->
+                val tab = uiActiveTab ?: return@setNeutralButton
+                val p = portInput.text.toString().trim().toIntOrNull() ?: (mainServerPort + tab.id)
+                serverPool.execute {
+                    val tPort = bindDedicatedPortToTab(tab, if (p == mainServerPort) mainServerPort + tab.id else p)
+                    mainHandler.post {
+                        Toast.makeText(this@MainActivity, "Tab #${tab.id} is now an independent window on port $tPort!", Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
+            .setNegativeButton("Pop-Out OS Window") { _, _ ->
+                val tab = uiActiveTab ?: return@setNegativeButton
+                spawnIndependentOsWindow(tab.url, 0, closeCurrentTab = false)
+            }
+            .show()
     }
 
     private fun parseQueryParams(rawPath: String): JSONObject {
@@ -809,7 +1015,7 @@ class MainActivity : Activity() {
         val curId = activeTab?.id ?: -1
         for (i in 0 until tabs.size) {
             val t = tabs[i]
-            arr.put(JSONObject().put("tab_id", t.id).put("index", i).put("virtual_dom_id", 9000 + t.id).put("active", t.id == curId).put("url", t.url).put("title", t.title))
+            arr.put(JSONObject().put("tab_id", t.id).put("index", i).put("virtual_dom_id", 9000 + t.id).put("active", t.id == curId).put("dedicated_port", t.dedicatedPort).put("independent_endpoint", if (t.dedicatedPort > 0) "http://127.0.0.1:${t.dedicatedPort}" else "").put("url", t.url).put("title", t.title))
         }
         return arr
     }
@@ -1922,6 +2128,69 @@ class MainActivity : Activity() {
                 attachFreshStateAndDirective(res, "status")
             }
             "/page_text", "/text", "/reader" -> extractCleanPageTextSync(body)
+            "/port", "/set_port", "/change_port" -> {
+                val reqPort = body?.optInt("port", 0) ?: 0
+                val autoFallback = body?.optBoolean("auto_fallback", true) ?: true
+                if (reqPort in 1024..65535) {
+                    val prev = mainServerPort
+                    val bound = rebindMainServerPort(reqPort, autoFallback = autoFallback, saveToPrefs = true)
+                    JSONObject()
+                        .put("success", bound > 0)
+                        .put("status", if (bound > 0) "port_changed" else "bind_failed")
+                        .put("previous_port", prev)
+                        .put("port", bound)
+                        .put("endpoint", "http://127.0.0.1:$bound")
+                        .toString()
+                } else {
+                    JSONObject()
+                        .put("success", true)
+                        .put("main_port", mainServerPort)
+                        .put("current_bound_port", SERVER_PORT)
+                        .put("tabs", buildTabsJsonArray())
+                        .toString()
+                }
+            }
+            "/tab_window", "/isolate_tab", "/tab_port" -> {
+                val targetId = body?.optInt("tab_id", -1) ?: -1
+                val reqPort = body?.optInt("port", 0) ?: 0
+                val openUrl = body?.optString("url", "") ?: ""
+                val switchUi = body?.optBoolean("switch", false) ?: false
+
+                var targetTab = if (targetId > 0) findTabByQuery(tabId = targetId) else null
+                if (targetTab == null) {
+                    val initUrl = openUrl.ifEmpty { "https://gemini.google.com" }
+                    runOnMainSync { targetTab = createNewTab(initUrl, switchToIt = switchUi) }
+                } else if (openUrl.isNotEmpty()) {
+                    val t = targetTab!!
+                    runOnMainSync { t.webView.loadUrl(openUrl) }
+                }
+
+                val tab = targetTab!!
+                val boundPort = bindDedicatedPortToTab(tab, reqPort)
+                JSONObject()
+                    .put("success", boundPort > 0)
+                    .put("status", "tab_isolated_as_independent_window")
+                    .put("tab_id", tab.id)
+                    .put("dedicated_port", boundPort)
+                    .put("independent_endpoint", "http://127.0.0.1:$boundPort")
+                    .put("url", tab.url)
+                    .put("message", "Tab #${tab.id} now runs on its own independent port $boundPort without interfering with other tabs!")
+                    .toString()
+            }
+            "/spawn_window", "/new_window" -> {
+                val url = body?.optString("url", currentUrl) ?: currentUrl
+                val reqPort = body?.optInt("port", 0) ?: 0
+                val closeCur = body?.optBoolean("close_current_tab", false) ?: false
+                val spawnedPort = spawnIndependentOsWindow(url, reqPort, closeCur)
+                JSONObject()
+                    .put("success", true)
+                    .put("status", "os_window_spawned")
+                    .put("new_window_port", spawnedPort)
+                    .put("new_window_endpoint", "http://127.0.0.1:$spawnedPort")
+                    .put("url", url)
+                    .toString()
+            }
+
             "/raw_log", "/commit_log", "/build/logs", "/job_log" -> performFetchRawLogSync(body)
             "/complete_task", "/unlock_exit" -> {
                 val reason = body?.optString("summary", body.optString("reason", "")) ?: ""
