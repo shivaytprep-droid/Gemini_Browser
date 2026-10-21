@@ -362,7 +362,7 @@ class MainActivity : Activity() {
         val wv = WebView(this).apply {
             layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
             visibility = View.GONE; isFocusable = true; isFocusableInTouchMode = true
-            setLayerType(View.LAYER_TYPE_HARDWARE, null)
+            setLayerType(View.LAYER_TYPE_NONE, null); setBackgroundColor(Color.parseColor("#121212"))
         }
         val newTab = BrowserTab(id = id, webView = wv, url = initialUrl, title = "Tab $id")
         configureWebViewForTab(newTab)
@@ -521,27 +521,56 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun enforceDesktopViewportMeta(tab: BrowserTab) {
+        val isGeminiChat = tab.url.contains("gemini.google.com")
+        val wantDesktop = tab.desktopMode && !isGeminiChat
+        val js = """
+            (function() {
+                try {
+                    let meta = document.querySelector('meta[name="viewport"]');
+                    if ($wantDesktop) {
+                        if (!meta) {
+                            meta = document.createElement('meta');
+                            meta.name = 'viewport';
+                            (document.head || document.documentElement).appendChild(meta);
+                        }
+                        if (!meta.hasAttribute('data-orig-vp')) {
+                            meta.setAttribute('data-orig-vp', meta.getAttribute('content') || '');
+                        }
+                        const desktopVp = 'width=1280, initial-scale=0.1, minimum-scale=0.1, maximum-scale=5.0, user-scalable=yes';
+                        if (meta.getAttribute('content') !== desktopVp) {
+                            meta.setAttribute('content', desktopVp);
+                        }
+                    } else if (meta && meta.hasAttribute('data-orig-vp')) {
+                        const orig = meta.getAttribute('data-orig-vp') || 'width=device-width, initial-scale=1.0';
+                        meta.setAttribute('content', orig);
+                    }
+                } catch (e) {}
+            })();
+        """.trimIndent()
+        tab.webView.evaluateJavascript(js, null)
+    }
+
     private fun updateWebViewViewportBounds(targetTab: BrowserTab? = activeTab) {
         val tab = targetTab ?: return
         val wv = tab.webView
-        val cw = webContainer.width; val ch = webContainer.height
-        if (cw <= 0 || ch <= 0) return
 
-        val isGeminiChat = tab.url.contains("gemini.google.com")
-        if (tab.desktopMode && !isGeminiChat) {
-            val targetPxW = (1280f * resources.displayMetrics.density).toInt()
-            val scale = cw.toFloat() / targetPxW.toFloat()
-            val targetPxH = (ch.toFloat() / scale).toInt()
-            wv.pivotX = 0f; wv.pivotY = 0f; wv.scaleX = scale; wv.scaleY = scale
-            val lp = wv.layoutParams as FrameLayout.LayoutParams
-            if (lp.width != targetPxW || lp.height != targetPxH) { lp.width = targetPxW; lp.height = targetPxH; wv.layoutParams = lp }
-        } else {
-            wv.pivotX = 0f; wv.pivotY = 0f; wv.scaleX = 1f; wv.scaleY = 1f
-            val lp = wv.layoutParams as FrameLayout.LayoutParams
-            if (lp.width != ViewGroup.LayoutParams.MATCH_PARENT || lp.height != ViewGroup.LayoutParams.MATCH_PARENT) {
-                lp.width = ViewGroup.LayoutParams.MATCH_PARENT; lp.height = ViewGroup.LayoutParams.MATCH_PARENT; wv.layoutParams = lp
-            }
+        // Always keep WebView at 1:1 native screen bounds so Chromium tile compositor never clips or blinks!
+        wv.pivotX = 0f
+        wv.pivotY = 0f
+        wv.scaleX = 1f
+        wv.scaleY = 1f
+
+        val lp = wv.layoutParams as FrameLayout.LayoutParams
+        if (lp.width != ViewGroup.LayoutParams.MATCH_PARENT || lp.height != ViewGroup.LayoutParams.MATCH_PARENT) {
+            lp.width = ViewGroup.LayoutParams.MATCH_PARENT
+            lp.height = ViewGroup.LayoutParams.MATCH_PARENT
+            wv.layoutParams = lp
         }
+
+        wv.settings.useWideViewPort = true
+        wv.settings.loadWithOverviewMode = true
+        enforceDesktopViewportMeta(tab)
     }
 
     private fun applyDesktopMode(enable: Boolean) {
@@ -603,6 +632,7 @@ class MainActivity : Activity() {
                 tab.isPageLoading = true; tab.isNetworkIdle = false; tab.url = url ?: ""
                 domGeneration.incrementAndGet()
                 if (activeTab?.id == tab.id) urlInput.setText(tab.url)
+                enforceDesktopViewportMeta(tab)
                 injectStealthViewportAndTracker(tab)
                 refreshTabBarUi()
             }
@@ -612,6 +642,7 @@ class MainActivity : Activity() {
                 domGeneration.incrementAndGet()
                 if (activeTab?.id == tab.id) urlInput.setText(tab.url)
                 CookieManager.getInstance().flush()
+                enforceDesktopViewportMeta(tab)
                 injectStealthViewportAndTracker(tab)
                 injectSavedUserScripts(wv, tab.url)
                 refreshTabBarUi()
@@ -2513,7 +2544,7 @@ class MainActivity : Activity() {
             try {
                 val b = Bitmap.createBitmap(overlayView.width.coerceAtLeast(1), overlayView.height.coerceAtLeast(1), Bitmap.Config.ARGB_8888)
                 val c = Canvas(b)
-                c.scale(webView.scaleX, webView.scaleY); webView.draw(c)
+                c.translate(-webView.scrollX.toFloat(), -webView.scrollY.toFloat()); webView.draw(c)
                 bmp = b
             } catch (_: Exception) {}
         }
