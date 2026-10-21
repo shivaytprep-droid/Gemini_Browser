@@ -525,49 +525,108 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun enforceDesktopViewport(tab: BrowserTab, forceZoomOut: Boolean = false) {
+        val wv = tab.webView
+        wv.settings.useWideViewPort = true
+        wv.settings.loadWithOverviewMode = true
+        wv.settings.layoutAlgorithm = WebSettings.LayoutAlgorithm.NORMAL
+
+        if (tab.desktopMode) {
+            val js = """
+                (function() {
+                    try {
+                        const root = document.head || document.documentElement;
+                        if (!root) return 'no_head';
+                        const targetW = 1280;
+                        const sw = Math.min(window.screen.width || 360, 480);
+                        const initScale = Math.max(0.25, Math.round((sw / targetW) * 1000) / 1000);
+                        const vpContent = 'width=' + targetW + ', initial-scale=' + initScale + ', minimum-scale=0.25, maximum-scale=5.0, user-scalable=yes';
+
+                        function applyMeta() {
+                            const metas = document.querySelectorAll('meta[name="viewport"]');
+                            if (metas.length === 1 && metas[0].getAttribute('data-pc-vp') === '1' && metas[0].getAttribute('content') === vpContent) {
+                                return false;
+                            }
+                            metas.forEach(m => m.remove());
+                            const m = document.createElement('meta');
+                            m.setAttribute('name', 'viewport');
+                            m.setAttribute('data-pc-vp', '1');
+                            m.setAttribute('content', vpContent);
+                            root.insertBefore(m, root.firstChild);
+                            return true;
+                        }
+
+                        const changed = applyMeta();
+
+                        // Watch <head> in case GitHub Turbo/PJAX router overwrites <meta name="viewport">
+                        if (document.head && !window.__pcHeadWatched) {
+                            window.__pcHeadWatched = true;
+                            new MutationObserver(function() {
+                                applyMeta();
+                            }).observe(document.head, { childList: true, subtree: true, attributes: true, attributeFilter: ['content'] });
+                        }
+
+                        if (changed) {
+                            window.dispatchEvent(new Event('resize'));
+                            return 'applied:' + window.innerWidth;
+                        }
+                        return 'ok:' + window.innerWidth;
+                    } catch (e) {
+                        return 'err';
+                    }
+                })();
+            """.trimIndent()
+
+            wv.evaluateJavascript(js) { res ->
+                val clean = (res ?: "").replace("\"", "")
+                val curInnerW = clean.substringAfter(":", "0").toIntOrNull() ?: 0
+                if (forceZoomOut || clean.startsWith("applied:") || (curInnerW in 1..980)) {
+                    // Native WebView zoom-to-overview so page renders at 1280px inside normal MATCH_PARENT view!
+                    wv.zoomBy(0.01f)
+                    mainHandler.postDelayed({
+                        wv.evaluateJavascript("window.innerWidth") { wStr ->
+                            val w = (wStr ?: "").replace("\"", "").toIntOrNull() ?: 1280
+                            if (w < 1000) wv.zoomBy(0.01f)
+                        }
+                    }, 180)
+                }
+            }
+        } else {
+            val js = """
+                (function() {
+                    try {
+                        const metas = document.querySelectorAll('meta[name="viewport"]');
+                        metas.forEach(m => m.remove());
+                        const m = document.createElement('meta');
+                        m.setAttribute('name', 'viewport');
+                        m.setAttribute('content', 'width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes');
+                        (document.head || document.documentElement).appendChild(m);
+                        window.dispatchEvent(new Event('resize'));
+                    } catch (e) {}
+                })();
+            """.trimIndent()
+            wv.evaluateJavascript(js, null)
+        }
+    }
+
     private fun updateWebViewViewportBounds(targetTab: BrowserTab? = activeTab) {
         val tab = targetTab ?: return
         val wv = tab.webView
-        val cw = webContainer.width
-        val ch = webContainer.height
-        if (cw <= 0 || ch <= 0) return
 
-        // Keep LAYER_TYPE_NONE so Chromium renders tiles directly without hardware FBO clipping/blinking
-        if (wv.layerType != View.LAYER_TYPE_NONE) {
-            wv.setLayerType(View.LAYER_TYPE_NONE, null)
+        // Keep WebView at 1:1 normal screen size (MATCH_PARENT) so GPU tile manager NEVER drops tiles or blinks!
+        wv.pivotX = 0f
+        wv.pivotY = 0f
+        if (wv.scaleX != 1f) wv.scaleX = 1f
+        if (wv.scaleY != 1f) wv.scaleY = 1f
+
+        val lp = wv.layoutParams as FrameLayout.LayoutParams
+        if (lp.width != ViewGroup.LayoutParams.MATCH_PARENT || lp.height != ViewGroup.LayoutParams.MATCH_PARENT) {
+            lp.width = ViewGroup.LayoutParams.MATCH_PARENT
+            lp.height = ViewGroup.LayoutParams.MATCH_PARENT
+            wv.layoutParams = lp
         }
 
-        if (tab.desktopMode) {
-            val density = resources.displayMetrics.density
-            val targetCssWidth = 1280f
-            val targetPxW = (targetCssWidth * density).toInt()
-            val scale = cw.toFloat() / targetPxW.toFloat()
-            val targetPxH = (ch.toFloat() / scale).toInt()
-
-            wv.pivotX = 0f
-            wv.pivotY = 0f
-            if (wv.scaleX != scale) wv.scaleX = scale
-            if (wv.scaleY != scale) wv.scaleY = scale
-
-            val lp = wv.layoutParams as FrameLayout.LayoutParams
-            if (lp.width != targetPxW || lp.height != targetPxH) {
-                lp.width = targetPxW
-                lp.height = targetPxH
-                wv.layoutParams = lp
-            }
-        } else {
-            wv.pivotX = 0f
-            wv.pivotY = 0f
-            if (wv.scaleX != 1f) wv.scaleX = 1f
-            if (wv.scaleY != 1f) wv.scaleY = 1f
-
-            val lp = wv.layoutParams as FrameLayout.LayoutParams
-            if (lp.width != ViewGroup.LayoutParams.MATCH_PARENT || lp.height != ViewGroup.LayoutParams.MATCH_PARENT) {
-                lp.width = ViewGroup.LayoutParams.MATCH_PARENT
-                lp.height = ViewGroup.LayoutParams.MATCH_PARENT
-                wv.layoutParams = lp
-            }
-        }
+        enforceDesktopViewport(tab, forceZoomOut = false)
     }
 
     private fun applyDesktopMode(enable: Boolean) {
@@ -577,6 +636,8 @@ class MainActivity : Activity() {
             desktopBtn.text = if (enable) "PC" else "MOB"
             desktopBtn.setBackgroundColor(if (enable) Color.parseColor("#1565C0") else Color.parseColor("#333333"))
             tab.webView.settings.userAgentString = if (enable) desktopUA else mobileUA
+            tab.webView.settings.useWideViewPort = true
+            tab.webView.settings.loadWithOverviewMode = true
             updateWebViewViewportBounds(tab)
             tab.webView.reload()
         }
@@ -624,12 +685,16 @@ class MainActivity : Activity() {
 
         wv.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean = false
+            override fun onPageCommitVisible(view: WebView?, url: String?) {
+                super.onPageCommitVisible(view, url)
+                enforceDesktopViewport(tab, forceZoomOut = true)
+            }
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                 super.onPageStarted(view, url, favicon)
                 tab.isPageLoading = true; tab.isNetworkIdle = false; tab.url = url ?: ""
                 domGeneration.incrementAndGet()
                 if (activeTab?.id == tab.id) urlInput.setText(tab.url)
-                if (activeTab?.id == tab.id) updateWebViewViewportBounds(tab)
+                enforceDesktopViewport(tab, forceZoomOut = true)
                 injectStealthViewportAndTracker(tab)
                 refreshTabBarUi()
             }
@@ -639,7 +704,7 @@ class MainActivity : Activity() {
                 domGeneration.incrementAndGet()
                 if (activeTab?.id == tab.id) urlInput.setText(tab.url)
                 CookieManager.getInstance().flush()
-                if (activeTab?.id == tab.id) updateWebViewViewportBounds(tab)
+                enforceDesktopViewport(tab, forceZoomOut = true)
                 injectStealthViewportAndTracker(tab)
                 injectSavedUserScripts(wv, tab.url)
                 refreshTabBarUi()
@@ -652,6 +717,12 @@ class MainActivity : Activity() {
                 transport.webView = createNewTab("", true).webView
                 resultMsg.sendToTarget()
                 return true
+            }
+            override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                super.onProgressChanged(view, newProgress)
+                if (newProgress in 25..40 || newProgress == 100) {
+                    enforceDesktopViewport(tab, forceZoomOut = (newProgress <= 40))
+                }
             }
             override fun onReceivedTitle(view: WebView?, title: String?) {
                 if (!title.isNullOrBlank()) { tab.title = title; refreshTabBarUi() }
