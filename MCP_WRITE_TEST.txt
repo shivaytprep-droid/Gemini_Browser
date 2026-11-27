@@ -1,3 +1,0 @@
-Temporary Git MCP write-permission test.
-Created: 2026-11-27
-This file is intended for cleanup after verification.
